@@ -2232,6 +2232,11 @@ def add_floor(body:NewFloor,db:Session=Depends(db_session),u:dict=Depends(curren
         raise wrap_db_error(e)
 
 
+# Blocks with four rooms are present in the actual SPbGU beds_import workbook.
+# Use the same limit in manual room editing, block activation and Excel import.
+MAX_ROOMS_PER_BLOCK = 4
+
+
 class NewRoom(BaseModel):
     building_id:int
     floor_id:int
@@ -2293,8 +2298,8 @@ def add_room(body:NewRoom,db:Session=Depends(db_session),u:dict=Depends(current_
              bl=body.block_id,org=oid,b=body.building_id,f=body.floor_id)
         if not block:
             fail('Блок не относится к выбранному этажу',404)
-        if block['room_count']>=3:
-            fail('В блоке не может быть более трёх комнат',409)
+        if block['room_count']>=MAX_ROOMS_PER_BLOCK:
+            fail(f'В блоке не может быть более {MAX_ROOMS_PER_BLOCK} комнат',409)
     try:
         rid=scalar(db,"""INSERT INTO dorm_booking.rooms(organization_id,building_id,floor_id,block_id,
            comfort_category_id,room_number,capacity,gender_policy)
@@ -2393,8 +2398,8 @@ def update_block_status(block_id:int,body:BlockStatusIn,
           id=block_id,o=oid)
     if not block:
         fail('Блок не найден',404)
-    if body.status=='ACTIVE' and not (2<=block['rooms_count']<=3):
-        fail('Для активации блок должен включать 2–3 комнаты',409)
+    if body.status=='ACTIVE' and not (2<=block['rooms_count']<=MAX_ROOMS_PER_BLOCK):
+        fail(f'Для активации блок должен включать 2–{MAX_ROOMS_PER_BLOCK} комнаты',409)
     try:
         db.execute(text('UPDATE dorm_booking.blocks SET status=:status WHERE id=:id'),
             {'status':body.status,'id':block_id})
@@ -2476,8 +2481,8 @@ def admin_update_room(room_id:int,body:RoomUpdate,db:Session=Depends(db_session)
         block=row(db,"""SELECT bl.id,(SELECT count(*) FROM dorm_booking.rooms r WHERE r.block_id=bl.id AND r.id<>:room) AS rooms_count
           FROM dorm_booking.blocks bl WHERE bl.id=:id AND bl.building_id=:b AND bl.floor_id=:f AND bl.organization_id=:org""",
           id=body.block_id,b=existing['building_id'],f=existing['floor_id'],org=oid,room=room_id)
-        if not block or block['rooms_count']>=3:
-            fail('Неверный блок или в нём уже три комнаты',409)
+        if not block or block['rooms_count']>=MAX_ROOMS_PER_BLOCK:
+            fail(f'Неверный блок или в нём уже {MAX_ROOMS_PER_BLOCK} комнаты',409)
     try:
         db.execute(text('''UPDATE dorm_booking.rooms SET room_number=:number,capacity=:cap,
           comfort_category_id=:category,gender_policy=:gender,block_id=:block
@@ -2613,10 +2618,10 @@ async def import_beds_excel(
     db: Session = Depends(db_session),
     u: dict = Depends(current_user),
 ):
-    """Atomic import by visible room number, with safe creation of missing rooms.
+    """Atomic import with automatic creation of missing blocks and rooms.
 
-    The building, floor and optional block must already exist. Newly inferred rooms
-    stay INACTIVE and new beds DRAFT; publication remains an explicit operation.
+    Building/floor/category must exist. Newly created blocks and rooms remain
+    INACTIVE and beds DRAFT; publication remains an explicit operation.
     """
     oid = org_admin(u)
     if not file.filename or not file.filename.lower().endswith('.xlsx'):
@@ -2666,7 +2671,7 @@ async def import_beds_excel(
     for bed in existing_beds:
         if bed['status']!='ARCHIVED':
             counts[int(bed['room_id'])]=counts.get(int(bed['room_id']),0)+1
-    errors, prepared, new_rooms, seen = [], [], {}, set()
+    errors, prepared, new_rooms, new_blocks, seen = [], [], {}, {}, set()
 
     def one(items, what, predicate):
         found=[item for item in items if predicate(item)]
@@ -2677,8 +2682,9 @@ async def import_beds_excel(
     for index,record in raw_rows:
         try:
             bed_number=_excel_bed_number(record.get('bed_number'))
-            gender=_excel_choice(record.get('gender_policy'),IMPORT_GENDER_VALUES) or None
-            if gender not in (None,'ANY','MALE','FEMALE'):
+            # beds.gender_policy is NOT NULL; blank Excel means no restriction.
+            gender=_excel_choice(record.get('gender_policy'),IMPORT_GENDER_VALUES) or 'ANY'
+            if gender not in ('ANY','MALE','FEMALE'):
                 raise ValueError(f'Пол: «{record.get("gender_policy")}» — мужчины, женщины, без ограничений или пусто')
             raw_id=record.get('room_id')
             if raw_id is not None and str(raw_id).strip():
@@ -2699,18 +2705,30 @@ async def import_beds_excel(
                 floor=one(floors,'Этаж',lambda f:int(f['building_id'])==building_id and int(f['floor_number'])==floor_no)
                 floor_id=int(floor['id'])
                 block_name=str(record.get('block') or '').strip()
-                block_id=None
+                block_ref=None  # Existing block ID, or a key for a not-yet-created block.
                 if block_name:
-                    block=one(blocks,'Блок',lambda b:int(b['floor_id'])==floor_id and
-                              block_name.casefold() in {str(b['name']).strip().casefold(),str(b['code']).strip().casefold(),str(b['id'])})
-                    block_id=int(block['id'])
+                    if len(block_name)>150:
+                        raise ValueError('Блок: название не может быть длиннее 150 символов')
+                    matches=[b for b in blocks if int(b['building_id'])==building_id
+                             and int(b['floor_id'])==floor_id and block_name.casefold() in
+                             {str(b['name']).strip().casefold(),str(b['code'] or '').strip().casefold(),str(b['id'])}]
+                    if len(matches)>1:
+                        raise ValueError('Блок: найдено несколько совпадений; уточните значение')
+                    if matches:
+                        block_ref=int(matches[0]['id'])
+                    else:
+                        if building['building_layout']=='CORRIDOR':
+                            raise ValueError('Блок: для коридорного общежития нельзя создавать блоки; '
+                                             'проверьте планировку общежития')
+                        block_ref=('new_block',building_id,floor_id,block_name.casefold())
+                        new_blocks[block_ref]=(building_id,floor_id,block_name)
                 room_number=str(record.get('room_number') or '').strip()
                 if not room_number or len(room_number)>64:
                     raise ValueError('Номер комнаты: заполните номер длиной не более 64 символов')
                 same_number=[r for r in rooms if int(r['floor_id'])==floor_id
                        and str(r['room_number']).strip().casefold()==room_number.casefold()]
-                found=[r for r in same_number if r['block_id']==block_id]
-                if block_id is None and not found and any(r['block_id'] is not None for r in same_number):
+                found=[r for r in same_number if r['block_id']==block_ref]
+                if block_ref is None and not found and any(r['block_id'] is not None for r in same_number):
                     raise ValueError(f'Комната «{room_number}» существует в блоке: заполните столбец «Блок», чтобы не создавать дубликат')
                 if len(found)>1: raise ValueError(f'Комната «{room_number}»: найдено несколько совпадений')
                 category_raw=str(record.get('category') or '').strip()
@@ -2734,20 +2752,21 @@ async def import_beds_excel(
                         raise ValueError(f'Комната «{room_number}» отсутствует: укажите вместимость от 1 до 50')
                     if not cat or not cat['is_active']:
                         raise ValueError(f'Комната «{room_number}» отсутствует: укажите действующую категорию комфортности')
-                    key=('new',building_id,floor_id,block_id,room_number.casefold())
+                    key=('new',building_id,floor_id,block_ref,room_number.casefold())
                     capacity=cap_value
                     category=int(cat['id'])
                     room_id=None
-                    details=(building_id,floor_id,block_id,room_number,capacity,category)
+                    details=(building_id,floor_id,block_ref,room_number,capacity,category)
                     if key in new_rooms and new_rooms[key]!=details:
                         raise ValueError(f'Комната «{room_number}»: конфликт вместимости или категории в строках файла')
                     new_rooms[key]=details
-                    if block_id is not None:
-                        # Maximum three rooms per block (consistent with the manual editor).
-                        siblings={r['id'] for r in rooms if r['block_id']==block_id}
-                        added=sum(1 for k in new_rooms if k[0]=='new' and k[3]==block_id)
-                        if len(siblings)+added>3:
-                            raise ValueError(f'Блок «{block_name}»: нельзя создать более трёх комнат')
+                    if block_ref is not None:
+                        # Count distinct rooms, not the number of bed rows for each room.
+                        siblings={r['id'] for r in rooms if r['block_id']==block_ref}
+                        added=sum(1 for k in new_rooms if k[0]=='new' and k[3]==block_ref)
+                        if len(siblings)+added>MAX_ROOMS_PER_BLOCK:
+                            raise ValueError(f'Блок «{block_name}»: нельзя создать более '
+                                             f'{MAX_ROOMS_PER_BLOCK} комнат')
             raw_tariff=record.get('tariff_id')
             tariff_id=_excel_int(raw_tariff,'ID тарифа')
             if tariff_id is not None:
@@ -2765,19 +2784,53 @@ async def import_beds_excel(
         except ValueError as exc:
             errors.append({'row':index,'error':str(exc)})
     if errors:
-        return {'ok':False,'imported':0,'created_rooms':0,'total_errors':len(errors),'errors':errors[:100]}
+        return {'ok':False,'imported':0,'created_rooms':0,'created_blocks':0,
+                'total_errors':len(errors),'errors':errors[:100]}
 
     try:
         created={}
-        # Serialize imports creating rooms within the same floors; unique constraints
-        # also protect against concurrent inserts from the website.
-        for floor_id in sorted({details[1] for details in new_rooms.values()}):
+        created_blocks={}
+        inserted_block_ids=[]
+        # Serialize imports within the floors, so concurrent Excel imports cannot
+        # independently create the same named block on the same floor.
+        involved_floors={details[1] for details in new_rooms.values()}
+        involved_floors.update(details[1] for details in new_blocks.values())
+        for floor_id in sorted(involved_floors):
             db.execute(text("SELECT id FROM dorm_booking.floors WHERE id=:id AND organization_id=:org FOR UPDATE"),
                        {'id':floor_id,'org':oid})
-        for key,(building_id,floor_id,block_id,number,capacity,category) in new_rooms.items():
+
+        for block_key,(building_id,floor_id,name) in new_blocks.items():
+            # Recheck after the floor lock in case another import has committed
+            # the same block since our initial validation snapshot.
+            matches=rows(db,"""SELECT id FROM dorm_booking.blocks
+                WHERE organization_id=:org AND building_id=:b AND floor_id=:f
+                  AND lower(btrim(name))=:name ORDER BY id FOR UPDATE""",
+                org=oid,b=building_id,f=floor_id,name=name.casefold())
+            if len(matches)>1:
+                fail(f'Блок «{name}»: в БД уже есть несколько блоков с таким названием',409)
+            if matches:
+                created_blocks[block_key]=int(matches[0]['id'])
+                continue
+            bid=scalar(db,"""INSERT INTO dorm_booking.blocks
+                (organization_id,building_id,floor_id,name,gender_policy,status)
+                VALUES (:org,:b,:f,:name,'ANY','ACTIVE') RETURNING id""",
+                org=oid,b=building_id,f=floor_id,name=name)
+            code=f'SYS_BLOCK_{bid}'
+            if scalar(db,"""SELECT 1 FROM dorm_booking.blocks
+                    WHERE building_id=:building AND code=:code AND id<>:id""",
+                    building=building_id,code=code,id=bid):
+                code='SYS_BLOCK_'+secrets.token_hex(10).upper()
+            db.execute(text("""UPDATE dorm_booking.blocks SET code=:code
+                WHERE id=:id AND organization_id=:org"""),
+                {'code':code,'id':bid,'org':oid})
+            created_blocks[block_key]=int(bid)
+            inserted_block_ids.append(int(bid))
+
+        for key,(building_id,floor_id,block_ref,number,capacity,category) in new_rooms.items():
+            block_id=created_blocks[block_ref] if isinstance(block_ref,tuple) else block_ref
             rid=scalar(db,"""INSERT INTO dorm_booking.rooms
                   (organization_id,building_id,floor_id,block_id,comfort_category_id,room_number,capacity,status)
-                  VALUES (:o,:b,:f,:block,:category,:num,:capacity,'INACTIVE') RETURNING id""",
+                  VALUES (:o,:b,:f,:block,:category,:num,:capacity,'ACTIVE') RETURNING id""",
                   o=oid,b=building_id,f=floor_id,block=block_id,category=category,num=number,capacity=capacity)
             created[key]=rid
         for key,bed_number,gender,tariff_id in prepared:
@@ -2787,10 +2840,15 @@ async def import_beds_excel(
                 VALUES (:org,:room,:number,:gender,:tariff,'DRAFT')"""),
                 {'org':oid,'room':rid,'number':bed_number,'gender':gender,'tariff':tariff_id})
         log(db,u,'IMPORT_BEDS','beds',None,'Импорт конкретных мест из Excel',
-            {'count':len(prepared),'created_rooms':len(created)})
+            {'count':len(prepared),'created_rooms':len(created),
+             'created_blocks':len(inserted_block_ids),'new_block_ids':inserted_block_ids[:100]})
         db.commit()
         return {'ok':True,'imported':len(prepared),'created_rooms':len(created),
+                'created_blocks':len(inserted_block_ids),
                 'assigned_tariffs':sum(tariff_id is not None for _,_,_,tariff_id in prepared),'errors':[]}
+    except HTTPException:
+        db.rollback()
+        raise
     except SQLAlchemyError as exc:
         db.rollback()
         raise wrap_db_error(exc)
