@@ -1,4 +1,4 @@
-"""SPbGU dorm booking — PostgreSQL-backed API, no preview or mocked records."""
+"""SPbGU dorm booking - PostgreSQL-backed API, no preview or mocked records."""
 from __future__ import annotations
 
 import base64
@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+import s3_storage
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
@@ -139,7 +140,7 @@ def audit_failed_api_request(request: Request, status: int, reason: str):
         if engine is None:
             engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
         actor_id = None
-        org_id = None
+        org_id = getattr(request.state, 'support_org_id', None)
         cookie = request.cookies.get(COOKIE)
         if cookie:
             try:
@@ -155,7 +156,8 @@ def audit_failed_api_request(request: Request, status: int, reason: str):
                     'SELECT id,organization_id FROM dorm_booking.users WHERE id=:id'),
                     {'id': actor_id}).mappings().first()
                 actor_id = identity['id'] if identity else None
-                org_id = identity['organization_id'] if identity else None
+                if org_id is None:
+                    org_id = identity['organization_id'] if identity else None
             connection.execute(text('''
                 INSERT INTO dorm_booking.activity_logs
                   (organization_id,actor_user_id,event_type,entity_type,result,message,details)
@@ -184,6 +186,27 @@ async def audit_failed_requests(request: Request, call_next):
         reason = getattr(request.state, 'failure_reason', '') or (
             'Ошибка HTTP ' + str(response.status_code) + ' при выполнении ' + request.method)
         audit_failed_api_request(request, response.status_code, reason)
+    elif (getattr(request.state, 'support_org_id', None) and
+          request.method in ('POST','PUT','PATCH','DELETE') and
+          request.url.path.startswith('/api/admin/')):
+        # An independent audit record ensures every support-mode mutation is
+        # attributable to the actual platform administrator, even if the older
+        # business handler did not call log(). Do not persist payloads/secrets.
+        import logging
+        try:
+            with engine.begin() as connection:
+                connection.execute(text('''
+                    INSERT INTO dorm_booking.activity_logs
+                    (organization_id,actor_user_id,event_type,entity_type,result,message,details)
+                    VALUES (:org,:actor,'PLATFORM_SUPPORT_API_ACTION','platform_support','SUCCESS',
+                            'Администратор платформы выполнил действие в режиме поддержки',
+                            CAST(:details AS jsonb))
+                '''), {'org':request.state.support_org_id,
+                       'actor':request.state.support_actor_id,
+                       'details':json.dumps({'method':request.method,'path':request.url.path[:180],
+                                             'status_code':response.status_code},ensure_ascii=False)})
+        except Exception:
+            logging.getLogger('dorm_booking.support').exception('Support audit failure')
     return response
 
 
@@ -418,13 +441,16 @@ def organization_creation_db_error(exc: SQLAlchemyError, stage: str) -> HTTPExce
 def log(db: Session, actor: Optional[dict], event: str, entity: Optional[str] = None,
         entity_id: Optional[int] = None, message: str = '', details: Optional[dict] = None,
         org_id: Optional[int] = None):
+    payload=dict(details or {})
+    if (actor or {}).get('platform_support_mode'):
+        payload.update(platform_support=True, platform_actor_id=actor['id'])
     db.execute(text("""
         INSERT INTO dorm_booking.activity_logs
         (organization_id, actor_user_id, event_type, entity_type, entity_id, result, message, details)
         VALUES (:org, :actor, :evt, :entity, :id, 'SUCCESS', :message, CAST(:details AS jsonb))
     """), dict(org=org_id if org_id is not None else (actor or {}).get('organization_id'),
                 actor=(actor or {}).get('id'), evt=event, entity=entity, id=entity_id,
-                message=message, details=json.dumps(details or {}, ensure_ascii=False)))
+                message=message, details=json.dumps(payload, ensure_ascii=False)))
 
 
 def make_hash(password: str) -> str:
@@ -464,6 +490,8 @@ def current_user(request: Request, db: Session = Depends(db_session)) -> dict:
     except (BadSignature, SignatureExpired):
         fail('Сессия недействительна или истекла', 401)
     u = row(db, 'SELECT * FROM dorm_booking.users WHERE id=:id', id=int(identity['id']))
+    if u and u.get('deleted_at'):
+        fail('Доступ к удалённой учётной записи отключён', 403)
     if u and u['status'] == 'BLOCKED':
         fail('Данный аккаунт заблокирован', 403)
     if not u or u['status'] != 'ACTIVE':
@@ -472,8 +500,34 @@ def current_user(request: Request, db: Session = Depends(db_session)) -> dict:
         fail('Сессия устарела. Войдите снова', 401)
     if u['organization_id']:
         org = row(db, 'SELECT * FROM dorm_booking.organizations WHERE id=:id', id=u['organization_id'])
-        if not org or org['platform_blocked_at'] or (org['status'] != 'ACTIVE' and u['role'] != 'ORG_ADMIN'):
-            fail('Организация недоступна', 403)
+        # Disabled organizations cannot be administered using their regular
+        # accounts/sessions. Only the audited platform support session below
+        # can access them while status=INACTIVE.
+        if not org or org['platform_blocked_at'] or org['status'] != 'ACTIVE':
+            fail('Организация недоступна: доступ временно отключён', 403)
+    support_token = identity.get('platform_support_token')
+    if support_token:
+        # A platform administrator temporarily acquires organization-scoped
+        # permissions ONLY for a disabled organization. Identity stays real.
+        if u['role'] != 'PLATFORM_ADMIN' or u['organization_id'] is not None:
+            fail('Недопустимая сессия сопровождения', 403)
+        token_hash=hashlib.sha256(str(support_token).encode('utf-8')).hexdigest()
+        support=row(db, '''SELECT s.organization_id,s.target_organization_id,s.actor_user_id,
+                                  s.reason,o.status AS organization_status,o.name AS organization_name,
+                                  o.short_name AS organization_short_name
+            FROM dorm_booking.platform_support_sessions s
+            JOIN dorm_booking.organizations o ON o.id=s.organization_id
+            WHERE s.token_hash=:token_hash AND s.actor_user_id=:actor
+              AND s.ended_at IS NULL AND s.expires_at>now()''',
+            token_hash=token_hash,actor=u['id'])
+        if not support or support['organization_status']!='INACTIVE':
+            fail('Сессия сопровождения завершена или организация активна. Вернитесь в кабинет платформы.',403)
+        request.state.support_org_id=support['organization_id']
+        request.state.support_actor_id=u['id']
+        u={**u,'role':'ORG_ADMIN','organization_id':support['organization_id'],
+           'platform_support_mode':True,'platform_actor_id':u['id'],
+           'organization_name':support['organization_name'],
+           'organization_short_name':support['organization_short_name']}
     return u
 
 
@@ -570,6 +624,95 @@ def public_catalog_cities(db:Session=Depends(db_session)):
       ORDER BY o.city""")]
 
 
+# Public partnership enquiries are not organization accounts and do not grant booking access.
+class PartnerApplicationIn(BaseModel):
+    organization_name: str = Field(min_length=3, max_length=255)
+    organization_type: str
+    city: str = Field(min_length=2, max_length=120)
+    contact_name: str = Field(min_length=3, max_length=150)
+    contact_email: str = Field(min_length=5, max_length=320)
+    contact_phone: str = Field(min_length=6, max_length=40)
+    website_url: Optional[str] = Field(default=None, max_length=500)
+    description: Optional[str] = Field(default=None, max_length=2000)
+    consent: bool
+
+
+@app.post('/api/partner-applications', status_code=201)
+def submit_partner_application(body: PartnerApplicationIn, db: Session = Depends(db_session)):
+    if body.organization_type not in ('HOSTEL', 'DORMITORY'):
+        fail('Выберите тип партнёра: хостел или общежитие', 422)
+    if not body.consent:
+        fail('Необходимо согласие на обработку контактных данных', 422)
+    email = body.contact_email.strip().lower()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
+        fail('Укажите корректный email', 422)
+    if body.website_url and not re.fullmatch(r'https?://[^\s]+', body.website_url.strip(), re.I):
+        fail('Адрес сайта должен начинаться с https:// или http://', 422)
+    # An unfinished application from the same partner must not be duplicated.
+    existing = scalar(db, """SELECT id FROM dorm_booking.partner_applications
+        WHERE lower(contact_email)=:email AND lower(organization_name)=lower(:name)
+          AND status IN ('NEW','IN_REVIEW') LIMIT 1""",
+        email=email, name=body.organization_name.strip())
+    if existing:
+        fail('Заявка с такими контактами уже рассматривается', 409)
+    try:
+        application_id = scalar(db, """INSERT INTO dorm_booking.partner_applications
+           (organization_name, organization_type, city, contact_name, contact_email,
+            contact_phone, website_url, description, consent_at)
+           VALUES (:name,:type,:city,:contact,:email,:phone,:website,:description,now())
+           RETURNING id""",
+            name=body.organization_name.strip(), type=body.organization_type,
+            city=body.city.strip(), contact=body.contact_name.strip(), email=email,
+            phone=body.contact_phone.strip(),
+            website=(body.website_url or '').strip() or None,
+            description=(body.description or '').strip() or None)
+        log(db, None, 'PARTNER_APPLICATION_SUBMITTED', 'partner_applications', application_id,
+            'Новая заявка на сотрудничество')
+        db.commit()
+        return {'id': application_id, 'status':'NEW', 'message':'Заявка направлена администратору платформы'}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise wrap_db_error(exc)
+
+
+class PartnerApplicationReview(BaseModel):
+    status: str
+    review_note: Optional[str] = Field(default=None, max_length=2000)
+
+
+@app.get('/api/platform/partner-applications')
+def platform_partner_applications(db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u, 'PLATFORM_ADMIN')
+    return rows(db, """SELECT pa.*, rv.login AS reviewed_by_login
+      FROM dorm_booking.partner_applications pa
+      LEFT JOIN dorm_booking.users rv ON rv.id=pa.reviewed_by
+      ORDER BY CASE WHEN pa.status='NEW' THEN 0 WHEN pa.status='IN_REVIEW' THEN 1 ELSE 2 END,
+        pa.created_at DESC, pa.id DESC""")
+
+
+@app.put('/api/platform/partner-applications/{application_id}')
+def review_partner_application(application_id:int, body:PartnerApplicationReview,
+                               db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u, 'PLATFORM_ADMIN')
+    if body.status not in ('IN_REVIEW','APPROVED','REJECTED'):
+        fail('Неизвестное решение по заявке', 422)
+    try:
+        record = row(db, """UPDATE dorm_booking.partner_applications
+          SET status=:status, review_note=:note, reviewed_by=:user,
+              reviewed_at=now(), updated_at=now()
+          WHERE id=:id RETURNING id,organization_name,status""",
+          id=application_id,status=body.status,note=(body.review_note or '').strip() or None,user=u['id'])
+        if not record:
+            fail('Заявка не найдена', 404)
+        log(db,u,'PARTNER_APPLICATION_REVIEWED','partner_applications',application_id,
+            f'Решение по заявке: {body.status}',{'status':body.status})
+        db.commit()
+        return record
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise wrap_db_error(exc)
+
+
 @app.post('/api/login')
 def login(body: LoginInput, response: Response, db: Session = Depends(db_session)):
     # Organization scoped login; if multiple organizations share login, explicit selection is required.
@@ -581,7 +724,7 @@ def login(body: LoginInput, response: Response, db: Session = Depends(db_session
     if len(choices) != 1 or not verify_hash(body.password, choices[0].get('password_hash')):
         fail('Неверный логин, пароль или организация', 401)
     u = choices[0]
-    if u['status'] == 'BLOCKED':
+    if u.get('deleted_at') or u['status'] == 'BLOCKED':
         fail('Данный аккаунт заблокирован', 403)
     if u['status'] != 'ACTIVE' and not (u['status'] == 'PENDING' and u['role'] == 'STUDENT'):
         fail('Вход для данной учётной записи пока недоступен', 403)
@@ -600,7 +743,21 @@ def login(body: LoginInput, response: Response, db: Session = Depends(db_session
 
 
 @app.post('/api/logout')
-def logout(response: Response):
+def logout(response: Response, request:Request, db:Session=Depends(db_session)):
+    # Revoke privileged support access when the real platform administrator logs out.
+    cookie=request.cookies.get(COOKIE)
+    if cookie:
+        try:
+            identity=serializer.loads(cookie,max_age=SESSION_TTL)
+            token=identity.get('platform_support_token')
+            if token:
+                th=hashlib.sha256(str(token).encode()).hexdigest()
+                db.execute(text('''UPDATE dorm_booking.platform_support_sessions SET ended_at=now()
+                  WHERE token_hash=:token AND actor_user_id=:actor AND ended_at IS NULL'''),
+                  {'token':th,'actor':int(identity['id'])})
+                db.commit()
+        except (BadSignature,SignatureExpired,ValueError,KeyError,TypeError):
+            db.rollback()
     response.delete_cookie(COOKIE, path='/')
     return {'ok': True}
 
@@ -731,11 +888,12 @@ class SearchFilters(BaseModel):
 
 
 # Query actual inventory by selected dates (not only currently free beds).
-# For an unauthenticated visitor, show available published tariff values without guessing nationality.
+# Anonymous visitors receive only building descriptions from /api/catalog, never tariff or inventory values.
 # Before booking, tariff and fee are recalculated for the authenticated person in PostgreSQL.
 CATALOG_EXACT = """
  SELECT b.id AS bed_id, bu.id AS building_id,bu.organization_id,bu.name AS building_name,
  bu.address,bu.district,bu.latitude,bu.longitude,bu.description AS building_description,
+ o.brand_primary_color AS organization_primary_color,
  r.id AS room_id,r.room_number,r.capacity,f.id AS floor_id,f.floor_number,
  r.block_id,bl.name AS block_name,c.id AS category_id,c.name AS category_name,
  b.bed_number,'EXACT_BED' AS mode,b.id AS offer_id,
@@ -800,7 +958,8 @@ CATALOG_EXACT = """
 CATALOG_QUOTA = """
  SELECT q.id AS offer_id,q.id AS quota_pool_id,q.building_id,bu.organization_id,
  bu.name AS building_name,bu.address,bu.district,bu.latitude,bu.longitude,
- bu.description AS building_description,c.id AS category_id,c.name AS category_name,
+ bu.description AS building_description,o.brand_primary_color AS organization_primary_color,
+ c.id AS category_id,c.name AS category_name,
  q.room_capacity AS capacity,q.name AS pool_name,q.gender_policy,
  t.amount AS monthly_amount,t.billing_unit,t.id AS tariff_id,'QUOTA' AS mode,q.quantity,
  LEAST(
@@ -884,6 +1043,37 @@ def context_user(request: Request, db: Session):
 @app.post('/api/catalog')
 def catalog(f: SearchFilters, request: Request, db: Session = Depends(db_session)):
     visitor = context_user(request, db)
+    if visitor is None:
+        # Public visitors can browse building locations, not availability,
+        # physical beds, tariff prices, or any offers. Ignore availability filters.
+        if f.min_capacity and f.max_capacity and f.min_capacity > f.max_capacity:
+            fail('Неверный диапазон вместимости', 422)
+        public_org = f.organization_id
+        public_city = f.city or None
+        # Organization and city selections are cumulative; never discard the
+        # explicit organization choice when a city is present.
+        public_buildings = rows(db, """SELECT b.id,b.organization_id,b.name,b.address,
+            b.district,b.latitude,b.longitude,b.description,
+            o.brand_primary_color AS organization_primary_color
+            FROM dorm_booking.buildings b
+            JOIN dorm_booking.organizations o ON o.id=b.organization_id
+            WHERE b.status='ACTIVE' AND o.status='ACTIVE' AND o.platform_blocked_at IS NULL
+              AND (CAST(:organization_id AS bigint) IS NULL OR b.organization_id=:organization_id)
+              AND (CAST(:city AS text) IS NULL OR o.city=:city)
+              AND (CAST(:building_id AS bigint) IS NULL OR b.id=:building_id)
+              AND (CAST(:district AS text) IS NULL OR b.district=:district)
+            ORDER BY o.city,b.name,b.id""",
+            organization_id=public_org,city=public_city,building_id=f.building_id,district=f.district)
+        if public_buildings:
+            photos = rows(db, """SELECT DISTINCT ON (building_id) building_id,relative_path
+                FROM dorm_booking.media_files WHERE building_id=ANY(:ids)
+                ORDER BY building_id,is_primary DESC,sort_order,id""",
+                ids=[b['id'] for b in public_buildings])
+            by_building = {p['building_id']:p['relative_path'] for p in photos}
+            for b in public_buildings:
+                path = by_building.get(b['id'])
+                b['photo_url'] = media_location(path) if path else None
+        return {'buildings':public_buildings, 'public_only':True}
     start, finish, profile_ok = personal_view_period(db, visitor, f.check_in, f.check_out)
     if finish <= start:
         fail('Дата выезда должна быть позже заселения')
@@ -939,6 +1129,7 @@ def catalog(f: SearchFilters, request: Request, db: Session = Depends(db_session
         building = buildings.setdefault(o['building_id'], dict(id=o['building_id'],organization_id=o['organization_id'],
             name=o['building_name'],address=o.get('address'),district=o.get('district'),
             latitude=o.get('latitude'),longitude=o.get('longitude'),description=o.get('building_description'),
+            organization_primary_color=o.get('organization_primary_color'),
             free=0,min_price=float(o['monthly_amount']),price_unit=o.get('billing_unit','MONTH'),offers=[]))
         building['free'] += o.get('free_quantity') or 1
         building['min_price'] = min(building['min_price'],float(o['monthly_amount']))
@@ -948,7 +1139,7 @@ def catalog(f: SearchFilters, request: Request, db: Session = Depends(db_session
     additional = []
     if not f.available_only:
         additional = rows(db,"""SELECT bu.id,bu.organization_id,bu.name,bu.address,bu.district,
-          bu.latitude,bu.longitude,bu.description FROM dorm_booking.buildings bu
+          bu.latitude,bu.longitude,bu.description, org.brand_primary_color AS organization_primary_color FROM dorm_booking.buildings bu
           JOIN dorm_booking.organizations org ON org.id=bu.organization_id
           WHERE bu.status='ACTIVE' AND org.status='ACTIVE' AND org.platform_blocked_at IS NULL
           AND (CAST(:organization_id AS BIGINT) IS NULL OR bu.organization_id=:organization_id)
@@ -971,7 +1162,7 @@ def catalog(f: SearchFilters, request: Request, db: Session = Depends(db_session
         by_building = {p['building_id']:p['relative_path'] for p in photos}
         for item in result:
             path = by_building.get(item['id'])
-            item['photo_url'] = (path if path.startswith('/media/') else '/media/' + path.lstrip('/')) if path else None
+            item['photo_url'] = media_location(path) if path else None
     result.sort(key=lambda b: (b['min_price'] if b['min_price'] is not None else float('inf')) if sort.startswith('price') else b['free'],reverse=sort.endswith('desc'))
     return {'buildings':result,'offers_count':len(offers),'total_free':sum(b['free'] for b in result),
             'check_in':start,'check_out':finish,'sort':sort}
@@ -980,34 +1171,45 @@ def catalog(f: SearchFilters, request: Request, db: Session = Depends(db_session
 @app.get('/api/catalog/filters')
 def catalog_filters(organization_id: Optional[int] = None, city: Optional[str] = None,
                     request: Request = None, db: Session = Depends(db_session)):
+    """Visible, active catalog facets with strict tenant scoping.
+
+    Public callers also receive building->organization/district relationships so
+    the interface can cascade the three selectors without inventing results.
+    """
     visitor = context_user(request, db)
-    if visitor and visitor['role'] == 'ORG_ADMIN':
+    if visitor and visitor.get('organization_id'):
         organization_id = visitor['organization_id']
-        city = None
+        city = None  # Tenant scope must not be made empty by the global city setting.
+    visible_buildings = rows(db, """SELECT b.id,b.name,b.organization_id,b.district,o.city
+        FROM dorm_booking.buildings b
+        JOIN dorm_booking.organizations o ON o.id=b.organization_id
+        WHERE b.status='ACTIVE' AND o.status='ACTIVE'
+          AND o.platform_blocked_at IS NULL
+          AND (CAST(:org AS BIGINT) IS NULL OR b.organization_id=:org)
+          AND (CAST(:city AS TEXT) IS NULL OR o.city=:city)
+        ORDER BY o.short_name,b.name,b.id""", org=organization_id,city=city)
+    # The public facet set includes only public information. Organizations
+    # without buildings are still selectable through the public organizations list.
+    organizations = (rows(db, """SELECT o.id,COALESCE(NULLIF(o.short_name,''),o.name) AS name,o.city
+        FROM dorm_booking.organizations o
+        WHERE o.status='ACTIVE' AND o.platform_blocked_at IS NULL
+        ORDER BY o.short_name,o.id""") if visitor is None else [])
     return {
-        'districts':[r['district'] for r in rows(db, """SELECT DISTINCT b.district
-             FROM dorm_booking.buildings b
-             JOIN dorm_booking.organizations o ON o.id=b.organization_id
-             WHERE b.district IS NOT NULL
-               AND (CAST(:o AS BIGINT) IS NULL OR b.organization_id=:o)
-               AND (CAST(:city AS TEXT) IS NULL OR o.city=:city)
-             ORDER BY b.district""",o=organization_id,city=city)],
+        'organizations': organizations,
+        'public_buildings': visible_buildings if visitor is None else [],
+        'districts':sorted({b['district'] for b in visible_buildings if b.get('district')}),
         'categories':rows(db, """SELECT c.id,c.name,c.organization_id
              FROM dorm_booking.comfort_categories c
              JOIN dorm_booking.organizations o ON o.id=c.organization_id
-             WHERE c.is_active AND (CAST(:o AS BIGINT) IS NULL OR c.organization_id=:o)
-             AND (CAST(:city AS TEXT) IS NULL OR o.city=:city)
-             ORDER BY c.name""",o=organization_id,city=city),
-        'buildings':rows(db, """SELECT b.id,b.name,b.organization_id
-             FROM dorm_booking.buildings b
-             JOIN dorm_booking.organizations o ON o.id=b.organization_id
-             WHERE b.status='ACTIVE' AND (CAST(:o AS BIGINT) IS NULL OR b.organization_id=:o)
-             AND (CAST(:city AS TEXT) IS NULL OR o.city=:city)
-             ORDER BY b.name""",o=organization_id,city=city),
-        'amenities':rows(db, """SELECT id,code,name,amenity_group FROM dorm_booking.amenity_definitions
-             WHERE is_active AND (organization_id IS NULL OR organization_id=:o OR
-                (CAST(:city AS TEXT) IS NOT NULL AND organization_id IN (SELECT id FROM dorm_booking.organizations WHERE city=:city)))
-             ORDER BY name""",o=organization_id,city=city),
+             WHERE c.is_active AND o.status='ACTIVE' AND o.platform_blocked_at IS NULL
+               AND (CAST(:org AS BIGINT) IS NULL OR c.organization_id=:org)
+             ORDER BY c.name""", org=organization_id),
+        'buildings':[{'id':b['id'],'name':b['name'],'organization_id':b['organization_id']}
+                     for b in visible_buildings],
+        'amenities':rows(db, """SELECT id,code,name,amenity_group
+             FROM dorm_booking.amenity_definitions
+             WHERE is_active AND (organization_id IS NULL OR organization_id=:org)
+             ORDER BY name""",org=organization_id),
     }
 
 
@@ -1016,6 +1218,8 @@ def forecast(f: SearchFilters, request: Request, db: Session = Depends(db_sessio
     # Advisory only: future release is not a booking guarantee. Only currently occupied exact beds.
     # Keep the forecast restricted to the administrator's own organization too.
     visitor = context_user(request, db)
+    if visitor is None:
+        fail('Требуется вход в систему', 401)
     scoped_org = visitor['organization_id'] if visitor and visitor['role'] == 'ORG_ADMIN' else (None if f.city else f.organization_id)
     scoped_city = None if visitor and visitor['role'] == 'ORG_ADMIN' else f.city
     args = dict(org=scoped_org,city=scoped_city,district=f.district,category=f.category_id,
@@ -1106,6 +1310,7 @@ def require_guest_offer(db: Session, user: dict, mode: str, offer_id: int):
 
 @app.get('/api/buildings/{building_id}')
 def building_detail(building_id:int, request: Request, db: Session=Depends(db_session)):
+    current_user(request, db)
     require_guest_building(request, db, building_id)
     b=row(db,"""SELECT b.*,o.city AS city FROM dorm_booking.buildings b
         JOIN dorm_booking.organizations o ON o.id=b.organization_id
@@ -1128,6 +1333,8 @@ def building_detail(building_id:int, request: Request, db: Session=Depends(db_se
       FROM dorm_booking.floors f WHERE f.building_id=:id ORDER BY floor_number""",id=building_id)
     media=rows(db,"""SELECT relative_path,original_filename FROM dorm_booking.media_files
             WHERE building_id=:id ORDER BY is_primary DESC,sort_order,id""",id=building_id)
+    for image in media:
+        image['relative_path']=media_location(image['relative_path'])
     amenities=rows(db, """SELECT a.id,a.name,a.code,av.quantity,a.unit
        FROM dorm_booking.amenity_values av
        JOIN dorm_booking.amenity_definitions a ON a.id=av.amenity_id
@@ -1139,6 +1346,7 @@ def building_detail(building_id:int, request: Request, db: Session=Depends(db_se
 def floor_availability(building_id: int, request: Request, db: Session = Depends(db_session),
                        check_in: Optional[date] = None, check_out: Optional[date] = None):
     """Physical floor availability for the same stay as the signed-in person can book."""
+    current_user(request, db)
     require_guest_building(request, db, building_id)
     building = row(db, 'SELECT id,status FROM dorm_booking.buildings WHERE id=:id', id=building_id)
     if not building:
@@ -1227,6 +1435,7 @@ def floor_availability(building_id: int, request: Request, db: Session = Depends
 @app.get('/api/floors/{floor_id}/plan')
 def floor_plan(floor_id: int, request: Request, db: Session = Depends(db_session),
                check_in: Optional[date] = None, check_out: Optional[date] = None):
+    current_user(request, db)
     require_guest_building(request, db, scalar(db,
        'SELECT building_id FROM dorm_booking.floors WHERE id=:id',id=floor_id))
     floor = row(db,'SELECT * FROM dorm_booking.floors WHERE id=:id',id=floor_id)
@@ -1289,6 +1498,7 @@ def floor_plan(floor_id: int, request: Request, db: Session = Depends(db_session
 @app.get('/api/rooms/{room_id}/plan')
 def room_plan(room_id: int, request: Request, db: Session = Depends(db_session),
               check_in: Optional[date] = None, check_out: Optional[date] = None):
+    current_user(request, db)
     require_guest_building(request, db, scalar(db,
        'SELECT building_id FROM dorm_booking.rooms WHERE id=:id',id=room_id))
     room = row(db,"""SELECT r.*,c.name AS category_name,f.floor_number,
@@ -1350,6 +1560,11 @@ def room_plan(room_id: int, request: Request, db: Session = Depends(db_session),
          category=category,citizenship=citizenship,profile_ok=profile_ok)
     photos=rows(db,"""SELECT relative_path,original_filename FROM dorm_booking.media_files
         WHERE room_id=:id ORDER BY is_primary DESC,sort_order,id""",id=room_id)
+    for image in photos:
+        image['relative_path']=media_location(image['relative_path'])
+    for bed in beds:
+        for image in bed.get('photos') or []:
+            image['relative_path']=media_location(image['relative_path'])
     amenities=rows(db,"""SELECT a.id,a.name,a.code,av.quantity,a.unit FROM dorm_booking.amenity_values av
         JOIN dorm_booking.amenity_definitions a ON a.id=av.amenity_id
         WHERE av.room_id=:id AND av.is_present AND a.is_active ORDER BY a.name""",id=room_id)
@@ -1549,7 +1764,7 @@ def admin_dashboard(db:Session=Depends(db_session),u:dict=Depends(current_user))
         WHERE a.building_id=b.id) AS free_beds,
       (SELECT count(*)::integer FROM dorm_booking.quota_pools pool
         WHERE pool.building_id=b.id AND pool.status='ACTIVE') AS active_pools,
-      (SELECT CASE WHEN m.relative_path LIKE '/media/%' THEN m.relative_path
+      (SELECT CASE WHEN m.relative_path LIKE '/media/%' OR m.relative_path LIKE '/api/media/s3/%' THEN m.relative_path
               ELSE '/media/' || ltrim(m.relative_path,'/') END
        FROM dorm_booking.media_files m WHERE m.building_id=b.id
        ORDER BY m.is_primary DESC,m.sort_order,m.id LIMIT 1) AS photo_url
@@ -1658,6 +1873,8 @@ def inventory(db:Session=Depends(db_session),u:dict=Depends(current_user)):
          t.status AS tariff_status,
          r.room_number,r.id AS room_id,
          r.capacity,r.status AS room_status,r.comfort_category_id,
+         f.status AS floor_status,bu.status AS building_status,bl.status AS block_status,
+         dorm_booking.effective_bed_gender_policy(b.id) AS effective_gender_policy,
          (SELECT pb.pool_id FROM dorm_booking.quota_pool_beds pb WHERE pb.bed_id=b.id) AS pool_id,
          f.floor_number,bu.name AS building_name,bu.id AS building_id,c.name AS category_name,
          b.gender_policy AS gender_policy,
@@ -1668,6 +1885,7 @@ def inventory(db:Session=Depends(db_session),u:dict=Depends(current_user)):
        FROM dorm_booking.beds b JOIN dorm_booking.rooms r ON r.id=b.room_id
        JOIN dorm_booking.buildings bu ON bu.id=r.building_id
        JOIN dorm_booking.floors f ON f.id=r.floor_id
+       LEFT JOIN dorm_booking.blocks bl ON bl.id=r.block_id
        LEFT JOIN dorm_booking.comfort_categories c ON c.id=r.comfort_category_id
        LEFT JOIN dorm_booking.tariffs t ON t.id=b.tariff_id AND t.organization_id=b.organization_id
        WHERE b.organization_id=:o ORDER BY bu.name,f.floor_number,r.room_number,b.bed_number""",o=oid)
@@ -1893,7 +2111,7 @@ def validate_assigned_tariffs(db: Session, org_id: int, building_id: int,
                             f"ID {tariff['comfort_category_id']} не совпадает с категорией комнаты ID {comfort_id}")
         if int(tariff['room_capacity']) != int(capacity):
             problems.append(f"{label}: тариф рассчитан на {tariff['room_capacity']}-местную "
-                            f'комнату, фактическая вместимость — {capacity}')
+                            f'комнату, фактическая вместимость - {capacity}')
     if problems:
         fail('Нельзя назначить выбранные тарифы: ' + '; '.join(problems[:5]) +
              (f'; и ещё {len(problems)-5} несоответствий' if len(problems)>5 else '') +
@@ -2032,6 +2250,42 @@ def quota_step(quota_id:int,step:str,db:Session=Depends(db_session),u:dict=Depen
     except SQLAlchemyError as e:
         db.rollback()
         raise wrap_db_error(e)
+
+
+class QuotaBedsAdd(BaseModel):
+    bed_ids: list[int] = Field(min_length=1, max_length=5000)
+
+
+@app.post('/api/admin/quotas/{quota_id}/beds/add')
+def quota_add_beds(quota_id: int, body: QuotaBedsAdd,
+                   db: Session = Depends(db_session), u: dict = Depends(current_user)):
+    """Expand a PHYSICAL pool without replacing its existing memberships/reservations.
+
+    The v6.41 stored function locks and validates all beds, then adjusts
+    the physical set and virtual slot capacity in the same transaction.
+    """
+    org_id = org_admin(u)
+    ids = body.bed_ids
+    if len(ids) != len(set(ids)):
+        fail('В списке повторяются койко-места', 422)
+    pool = row(db, """SELECT id,inventory_mode,status,deleted_at
+        FROM dorm_booking.quota_pools WHERE id=:pool AND organization_id=:org""",
+        pool=quota_id,org=org_id)
+    if not pool or pool.get('deleted_at'):
+        fail('Физический пул не найден',404)
+    if pool['inventory_mode'] != 'PHYSICAL' or pool['status'] not in ('DRAFT','ACTIVE','INACTIVE'):
+        fail('Добавление мест допускается только для физического пула',409)
+    try:
+        result = row(db, "SELECT * FROM dorm_booking.add_quota_pool_beds(:pool,:actor,CAST(:ids AS bigint[]))",
+                     pool=quota_id,actor=u['id'],ids=ids)
+        log(db,u,'QUOTA_BEDS_ADDED','quota_pools',quota_id,
+            'Койко-места добавлены в физический пул',{'bed_ids':ids})
+        db.commit()
+        return {'ok':True,**(result or {})}
+    except HTTPException:
+        db.rollback(); raise
+    except SQLAlchemyError as exc:
+        db.rollback(); raise wrap_db_error(exc)
 
 
 class QuotaQuantityIn(BaseModel):
@@ -2232,11 +2486,6 @@ def add_floor(body:NewFloor,db:Session=Depends(db_session),u:dict=Depends(curren
         raise wrap_db_error(e)
 
 
-# Blocks with four rooms are present in the actual SPbGU beds_import workbook.
-# Use the same limit in manual room editing, block activation and Excel import.
-MAX_ROOMS_PER_BLOCK = 4
-
-
 class NewRoom(BaseModel):
     building_id:int
     floor_id:int
@@ -2274,7 +2523,7 @@ def add_room(body:NewRoom,db:Session=Depends(db_session),u:dict=Depends(current_
     for source, parent_gender in [('общежития', building_gender),
                                   ('этажа', floor_gender)]:
         if parent_gender in names and gender in names and parent_gender != gender:
-            fail(f'Нельзя создать комнату «{body.room_number}»: правило {source} — «{names[parent_gender]}», '
+            fail(f'Нельзя создать комнату «{body.room_number}»: правило {source} - «{names[parent_gender]}», '
                  f'а для комнаты выбрано «{names[gender]}». Выберите совместимое ограничение.', 409)
     if building_gender in names and floor_gender in names and building_gender != floor_gender:
         fail('Этаж имеет ограничение по полу, противоречащее правилу общежития. Исправьте параметры этажа.', 409)
@@ -2285,7 +2534,7 @@ def add_room(body:NewRoom,db:Session=Depends(db_session),u:dict=Depends(current_
             rule=block_gender['gender_policy']
             if gender in names and gender != rule:
                 fail(f'Нельзя создать комнату «{body.room_number}»: блок предназначен для '
-                     f'«{names[rule]}», а комната — для «{names[gender]}».',409)
+                     f'«{names[rule]}», а комната - для «{names[gender]}».',409)
             if any(g in names and g != rule for g in (building_gender, floor_gender)):
                 fail('Ограничение блока противоречит ограничению этажа или здания. Исправьте настройки блока.', 409)
         building=row(db,'SELECT building_layout FROM dorm_booking.buildings WHERE id=:id AND organization_id=:org',id=body.building_id,org=oid)
@@ -2298,8 +2547,8 @@ def add_room(body:NewRoom,db:Session=Depends(db_session),u:dict=Depends(current_
              bl=body.block_id,org=oid,b=body.building_id,f=body.floor_id)
         if not block:
             fail('Блок не относится к выбранному этажу',404)
-        if block['room_count']>=MAX_ROOMS_PER_BLOCK:
-            fail(f'В блоке не может быть более {MAX_ROOMS_PER_BLOCK} комнат',409)
+        if block['room_count']>=4:
+            fail('В блоке не может быть более четырёх комнат',409)
     try:
         rid=scalar(db,"""INSERT INTO dorm_booking.rooms(organization_id,building_id,floor_id,block_id,
            comfort_category_id,room_number,capacity,gender_policy)
@@ -2398,8 +2647,8 @@ def update_block_status(block_id:int,body:BlockStatusIn,
           id=block_id,o=oid)
     if not block:
         fail('Блок не найден',404)
-    if body.status=='ACTIVE' and not (2<=block['rooms_count']<=MAX_ROOMS_PER_BLOCK):
-        fail(f'Для активации блок должен включать 2–{MAX_ROOMS_PER_BLOCK} комнаты',409)
+    if body.status=='ACTIVE' and not (2<=block['rooms_count']<=4):
+        fail('Для активации блок должен включать 2–3 комнаты',409)
     try:
         db.execute(text('UPDATE dorm_booking.blocks SET status=:status WHERE id=:id'),
             {'status':body.status,'id':block_id})
@@ -2481,8 +2730,8 @@ def admin_update_room(room_id:int,body:RoomUpdate,db:Session=Depends(db_session)
         block=row(db,"""SELECT bl.id,(SELECT count(*) FROM dorm_booking.rooms r WHERE r.block_id=bl.id AND r.id<>:room) AS rooms_count
           FROM dorm_booking.blocks bl WHERE bl.id=:id AND bl.building_id=:b AND bl.floor_id=:f AND bl.organization_id=:org""",
           id=body.block_id,b=existing['building_id'],f=existing['floor_id'],org=oid,room=room_id)
-        if not block or block['rooms_count']>=MAX_ROOMS_PER_BLOCK:
-            fail(f'Неверный блок или в нём уже {MAX_ROOMS_PER_BLOCK} комнаты',409)
+        if not block or block['rooms_count']>=4:
+            fail('Неверный блок или в нём уже четыре комнаты',409)
     try:
         db.execute(text('''UPDATE dorm_booking.rooms SET room_number=:number,capacity=:cap,
           comfort_category_id=:category,gender_policy=:gender,block_id=:block
@@ -2574,6 +2823,7 @@ BED_IMPORT_HEADERS = {
     'Вместимость':'capacity', 'Категория комфортности':'category',
     'Номер койко-места':'bed_number', 'Номер места':'bed_number',
     'Пол':'gender_policy', 'ID тарифа':'tariff_id',
+    'Номера тарифов':'tariff_numbers', 'Номер тарифа':'tariff_numbers',
     'ID комнаты':'room_id',
 }
 IMPORT_GENDER_VALUES = {
@@ -2600,7 +2850,21 @@ def _excel_int(value, title, required=False):
             raise ValueError()
         return number
     except (ValueError, TypeError):
-        raise ValueError(f'{title}: «{value}» — требуется положительное целое число') from None
+        raise ValueError(f'{title}: «{value}» - требуется положительное целое число') from None
+
+
+def _excel_tariff_numbers(value):
+    """Organization-local tariff numbers, optionally separated by commas."""
+    if value is None or str(value).strip() == '':
+        return []
+    raw = str(value).strip()
+    parts = [part.strip() for part in raw.split(',')]
+    if not 1 <= len(parts) <= 100 or any(not re.fullmatch(r'[1-9]\d*(?:\.0)?', part) for part in parts):
+        raise ValueError('Номера тарифов: введите положительные номера через запятую, например «1, 2, 4»')
+    numbers = [int(part.split('.')[0]) for part in parts]
+    if any(number > 2147483647 for number in numbers) or len(set(numbers)) != len(numbers):
+        raise ValueError('Номера тарифов: номера должны быть уникальными положительными целыми числами')
+    return numbers
 
 
 def _excel_bed_number(value):
@@ -2618,10 +2882,11 @@ async def import_beds_excel(
     db: Session = Depends(db_session),
     u: dict = Depends(current_user),
 ):
-    """Atomic import with automatic creation of missing blocks and rooms.
+    """Atomic import: look up buildings/floors; create missing blocks and rooms.
 
-    Building/floor/category must exist. Newly created blocks and rooms remain
-    INACTIVE and beds DRAFT; publication remains an explicit operation.
+    User-facing tariff_numbers are organization-local tariff numbers. The old
+    global tariff_id column is accepted only for backward compatibility.
+    Beds remain DRAFT even when newly created blocks/rooms become ACTIVE.
     """
     oid = org_admin(u)
     if not file.filename or not file.filename.lower().endswith('.xlsx'):
@@ -2636,219 +2901,242 @@ async def import_beds_excel(
             sheet = book['Места'] if 'Места' in book.sheetnames else book.active
             iterator = sheet.values
             columns = _excel_headers(next(iterator, ()), {'bed_number'}, BED_IMPORT_HEADERS)
-            if 'room_id' not in columns and not {'building','floor','room_number'}.issubset(columns):
-                raise ValueError('Укажите столбцы «Общежитие», «Этаж», «Номер комнаты» (или старый room_id)')
-            raw_rows = [(i,dict(zip(columns,vals))) for i,vals in enumerate(iterator,2)
+            if 'room_id' not in columns and not {'building', 'floor', 'room_number'}.issubset(columns):
+                raise ValueError('Укажите «Общежитие», «Этаж», «Номер комнаты» (или ID комнаты)')
+            raw_rows = [(i, dict(zip(columns, vals))) for i, vals in enumerate(iterator, 2)
                         if any(v is not None and str(v).strip() for v in vals)]
         finally:
             book.close()
     except ValueError as exc:
-        return {'ok':False,'imported':0,'total_errors':1,'errors':[{'row':1,'error':str(exc)}]}
+        return {'ok': False, 'imported': 0, 'total_errors': 1,
+                'errors': [{'row': 1, 'error': str(exc)}]}
     except Exception:
         fail('Некорректный XLSX. Проверьте файл и заголовки столбцов')
-    if len(raw_rows)>MAX_IMPORT_ROWS:
+    if len(raw_rows) > MAX_IMPORT_ROWS:
         fail(f'Превышен лимит строк: {MAX_IMPORT_ROWS}')
     if not raw_rows:
-        return {'ok':False,'imported':0,'total_errors':1,'errors':[{'row':2,'error':'Нет строк для импорта'}]}
+        return {'ok': False, 'imported': 0, 'total_errors': 1,
+                'errors': [{'row': 2, 'error': 'Нет строк для импорта'}]}
 
-    buildings = rows(db,"""SELECT id,code,name,building_layout FROM dorm_booking.buildings
-        WHERE organization_id=:o""",o=oid)
-    floors = rows(db,"""SELECT id,building_id,floor_number,status FROM dorm_booking.floors
-        WHERE organization_id=:o""",o=oid)
-    blocks = rows(db,"""SELECT id,building_id,floor_id,name,code,status FROM dorm_booking.blocks
-        WHERE organization_id=:o""",o=oid)
-    categories = rows(db,"""SELECT id,name,is_active FROM dorm_booking.comfort_categories
-        WHERE organization_id=:o""",o=oid)
-    rooms = rows(db,"""SELECT id,building_id,floor_id,block_id,room_number,capacity,
-        comfort_category_id FROM dorm_booking.rooms WHERE organization_id=:o""",o=oid)
-    existing_rooms = {int(room['id']):room for room in rooms}
-    tariffs = {int(t['id']):t for t in rows(db,"""SELECT id,building_id,comfort_category_id,room_capacity
-        FROM dorm_booking.tariffs WHERE organization_id=:o AND status='ACTIVE'""",o=oid)}
-    existing_beds=rows(db,"""SELECT room_id,bed_number,status FROM dorm_booking.beds
-        WHERE organization_id=:o""",o=oid)
-    taken = {(int(b['room_id']),str(b['bed_number']).strip().casefold()) for b in existing_beds}
+    buildings = rows(db, """SELECT id,code,name,building_layout FROM dorm_booking.buildings
+        WHERE organization_id=:o""", o=oid)
+    floors = rows(db, """SELECT id,building_id,floor_number,status FROM dorm_booking.floors
+        WHERE organization_id=:o""", o=oid)
+    blocks = rows(db, """SELECT id,building_id,floor_id,name,code,status FROM dorm_booking.blocks
+        WHERE organization_id=:o""", o=oid)
+    categories = rows(db, """SELECT id,name,is_active FROM dorm_booking.comfort_categories
+        WHERE organization_id=:o""", o=oid)
+    rooms = rows(db, """SELECT id,building_id,floor_id,block_id,room_number,capacity,
+        comfort_category_id FROM dorm_booking.rooms WHERE organization_id=:o""", o=oid)
+    existing_rooms = {int(item['id']): item for item in rooms}
+    all_tariffs = rows(db, """SELECT id,tariff_number,building_id,comfort_category_id,
+        room_capacity,status FROM dorm_booking.tariffs WHERE organization_id=:o""", o=oid)
+    tariffs_by_id = {int(t['id']): t for t in all_tariffs}
+    tariffs_by_number = {}
+    for tariff in all_tariffs:
+        if tariff.get('tariff_number') is not None:
+            tariffs_by_number.setdefault(int(tariff['tariff_number']), []).append(tariff)
+    existing_beds = rows(db, """SELECT room_id,bed_number,status FROM dorm_booking.beds
+        WHERE organization_id=:o""", o=oid)
+    taken = {(int(b['room_id']), str(b['bed_number']).strip().casefold()) for b in existing_beds}
     counts = {}
     for bed in existing_beds:
-        if bed['status']!='ARCHIVED':
-            counts[int(bed['room_id'])]=counts.get(int(bed['room_id']),0)+1
+        if bed['status'] != 'ARCHIVED':
+            counts[int(bed['room_id'])] = counts.get(int(bed['room_id']), 0) + 1
     errors, prepared, new_rooms, new_blocks, seen = [], [], {}, {}, set()
+    allowed_bed_gender = {**IMPORT_GENDER_VALUES, **reference_input_values(db, 'gender_policy')}
 
     def one(items, what, predicate):
-        found=[item for item in items if predicate(item)]
-        if len(found)!=1:
-            raise ValueError(f'{what}: '+('не найдено' if not found else 'найдено несколько совпадений; уточните значение'))
+        found = [item for item in items if predicate(item)]
+        if len(found) != 1:
+            raise ValueError(f'{what}: ' + ('не найдено' if not found else 'несколько совпадений; уточните значение'))
         return found[0]
 
-    for index,record in raw_rows:
+    for index, record in raw_rows:
         try:
-            bed_number=_excel_bed_number(record.get('bed_number'))
-            # beds.gender_policy is NOT NULL; blank Excel means no restriction.
-            gender=_excel_choice(record.get('gender_policy'),IMPORT_GENDER_VALUES) or 'ANY'
-            if gender not in ('ANY','MALE','FEMALE'):
-                raise ValueError(f'Пол: «{record.get("gender_policy")}» — мужчины, женщины, без ограничений или пусто')
-            raw_id=record.get('room_id')
+            bed_number = _excel_bed_number(record.get('bed_number'))
+            gender = _excel_choice(record.get('gender_policy'), allowed_bed_gender) or 'ANY'
+            if gender not in ('ANY', 'MALE', 'FEMALE'):
+                raise ValueError(f'Пол: «{record.get("gender_policy")}» - мужчины, женщины или без ограничений')
+            raw_id = record.get('room_id')
             if raw_id is not None and str(raw_id).strip():
-                room_id=_excel_int(raw_id,'ID комнаты',True)
-                room=existing_rooms.get(room_id)
-                if not room: raise ValueError(f'ID комнаты: {room_id} — комната организации не найдена')
-                key=('existing',room_id)
-                capacity=int(room['capacity'])
-                category=int(room['comfort_category_id']) if room.get('comfort_category_id') is not None else None
-                building_id=int(room['building_id']) if room.get('building_id') is not None else None
+                room_id = _excel_int(raw_id, 'ID комнаты', True)
+                room = existing_rooms.get(room_id)
+                if not room:
+                    raise ValueError(f'ID комнаты: {room_id} - комната организации не найдена')
+                key = ('existing', room_id)
+                capacity = int(room['capacity'])
+                category = int(room['comfort_category_id']) if room.get('comfort_category_id') is not None else None
+                building_id = int(room['building_id']) if room.get('building_id') is not None else None
             else:
-                building_name=str(record.get('building') or '').strip()
-                if not building_name: raise ValueError('Общежитие: укажите название общежития')
-                building=one(buildings,'Общежитие',lambda b:building_name.casefold() in
-                             {str(b['name']).strip().casefold(),str(b['code']).strip().casefold(),str(b['id'])})
-                building_id=int(building['id'])
-                floor_no=_excel_int(record.get('floor'),'Этаж',True)
-                floor=one(floors,'Этаж',lambda f:int(f['building_id'])==building_id and int(f['floor_number'])==floor_no)
-                floor_id=int(floor['id'])
-                block_name=str(record.get('block') or '').strip()
-                block_ref=None  # Existing block ID, or a key for a not-yet-created block.
+                building_name = str(record.get('building') or '').strip()
+                if not building_name:
+                    raise ValueError('Общежитие: укажите название, код или ID')
+                building = one(buildings, 'Общежитие', lambda b: building_name.casefold() in
+                               {str(b['name']).strip().casefold(), str(b['code']).strip().casefold(), str(b['id'])})
+                building_id = int(building['id'])
+                floor_no = _excel_int(record.get('floor'), 'Этаж', True)
+                floor = one(floors, 'Этаж', lambda f: int(f['building_id']) == building_id
+                            and int(f['floor_number']) == floor_no)
+                floor_id = int(floor['id'])
+                block_name = str(record.get('block') or '').strip()
+                block_ref = None
                 if block_name:
-                    if len(block_name)>150:
-                        raise ValueError('Блок: название не может быть длиннее 150 символов')
-                    matches=[b for b in blocks if int(b['building_id'])==building_id
-                             and int(b['floor_id'])==floor_id and block_name.casefold() in
-                             {str(b['name']).strip().casefold(),str(b['code'] or '').strip().casefold(),str(b['id'])}]
-                    if len(matches)>1:
-                        raise ValueError('Блок: найдено несколько совпадений; уточните значение')
+                    if len(block_name) > 150:
+                        raise ValueError('Блок: название не может превышать 150 символов')
+                    if building.get('building_layout') == 'CORRIDOR':
+                        raise ValueError('Блок: в коридорном общежитии блоки не предусмотрены')
+                    matches = [b for b in blocks if int(b['floor_id']) == floor_id and
+                               block_name.casefold() in {str(b['name']).strip().casefold(),
+                                                         str(b['code']).strip().casefold(), str(b['id'])}]
+                    if len(matches) > 1:
+                        raise ValueError(f'Блок «{block_name}»: несколько совпадений на этаже')
                     if matches:
-                        block_ref=int(matches[0]['id'])
+                        block_ref = int(matches[0]['id'])
                     else:
-                        if building['building_layout']=='CORRIDOR':
-                            raise ValueError('Блок: для коридорного общежития нельзя создавать блоки; '
-                                             'проверьте планировку общежития')
-                        block_ref=('new_block',building_id,floor_id,block_name.casefold())
-                        new_blocks[block_ref]=(building_id,floor_id,block_name)
-                room_number=str(record.get('room_number') or '').strip()
-                if not room_number or len(room_number)>64:
+                        block_ref = ('auto_block', building_id, floor_id, block_name.casefold())
+                        new_blocks[block_ref] = (building_id, floor_id, block_name)
+                room_number = str(record.get('room_number') or '').strip()
+                if not room_number or len(room_number) > 64:
                     raise ValueError('Номер комнаты: заполните номер длиной не более 64 символов')
-                same_number=[r for r in rooms if int(r['floor_id'])==floor_id
-                       and str(r['room_number']).strip().casefold()==room_number.casefold()]
-                found=[r for r in same_number if r['block_id']==block_ref]
+                same_number = [r for r in rooms if int(r['floor_id']) == floor_id and
+                               str(r['room_number']).strip().casefold() == room_number.casefold()]
+                found = [r for r in same_number if r['block_id'] == block_ref]
                 if block_ref is None and not found and any(r['block_id'] is not None for r in same_number):
-                    raise ValueError(f'Комната «{room_number}» существует в блоке: заполните столбец «Блок», чтобы не создавать дубликат')
-                if len(found)>1: raise ValueError(f'Комната «{room_number}»: найдено несколько совпадений')
-                category_raw=str(record.get('category') or '').strip()
-                cap_value=_excel_int(record.get('capacity'),'Вместимость')
-                cat= None
+                    raise ValueError(f'Комната «{room_number}» уже есть в блоке: уточните столбец «Блок»')
+                if len(found) > 1:
+                    raise ValueError(f'Комната «{room_number}»: несколько совпадений')
+                category_raw = str(record.get('category') or '').strip()
+                cap_value = _excel_int(record.get('capacity'), 'Вместимость')
+                cat = None
                 if category_raw:
-                    cat=one(categories,'Категория комфортности',lambda c:category_raw.casefold() in
-                            {str(c['name']).strip().casefold(),str(c['id'])})
+                    cat = one(categories, 'Категория комфортности', lambda c: category_raw.casefold() in
+                              {str(c['name']).strip().casefold(), str(c['id'])})
                 if found:
-                    room=found[0]
-                    room_id=int(room['id'])
-                    key=('existing',room_id)
-                    capacity=int(room['capacity'])
-                    category=int(room['comfort_category_id']) if room.get('comfort_category_id') is not None else None
-                    if cap_value is not None and cap_value!=capacity:
-                        raise ValueError(f'Комната «{room_number}»: вместимость {cap_value} расходится с БД ({capacity})')
-                    if cat and int(cat['id'])!=category:
-                        raise ValueError(f'Комната «{room_number}»: категория комфортности не соответствует БД')
+                    room = found[0]
+                    room_id = int(room['id'])
+                    key = ('existing', room_id)
+                    capacity = int(room['capacity'])
+                    category = int(room['comfort_category_id']) if room.get('comfort_category_id') is not None else None
+                    if cap_value is not None and cap_value != capacity:
+                        raise ValueError(f'Комната «{room_number}»: вместимость {cap_value} не совпадает с БД ({capacity})')
+                    if cat and int(cat['id']) != category:
+                        raise ValueError(f'Комната «{room_number}»: категория комфортности отличается от БД')
                 else:
-                    if cap_value is None or not 1<=cap_value<=50:
-                        raise ValueError(f'Комната «{room_number}» отсутствует: укажите вместимость от 1 до 50')
+                    if cap_value is None or not 1 <= cap_value <= 50:
+                        raise ValueError(f'Комната «{room_number}» отсутствует: укажите вместимость 1–50')
                     if not cat or not cat['is_active']:
-                        raise ValueError(f'Комната «{room_number}» отсутствует: укажите действующую категорию комфортности')
-                    key=('new',building_id,floor_id,block_ref,room_number.casefold())
-                    capacity=cap_value
-                    category=int(cat['id'])
-                    room_id=None
-                    details=(building_id,floor_id,block_ref,room_number,capacity,category)
-                    if key in new_rooms and new_rooms[key]!=details:
-                        raise ValueError(f'Комната «{room_number}»: конфликт вместимости или категории в строках файла')
-                    new_rooms[key]=details
+                        raise ValueError(f'Комната «{room_number}» отсутствует: укажите действующую категорию')
+                    key = ('new', building_id, floor_id, block_ref, room_number.casefold())
+                    capacity, category, room_id = cap_value, int(cat['id']), None
+                    details = (building_id, floor_id, block_ref, room_number, capacity, category)
+                    if key in new_rooms and new_rooms[key] != details:
+                        raise ValueError(f'Комната «{room_number}»: конфликт вместимости или категории в Excel')
+                    new_rooms[key] = details
                     if block_ref is not None:
-                        # Count distinct rooms, not the number of bed rows for each room.
-                        siblings={r['id'] for r in rooms if r['block_id']==block_ref}
-                        added=sum(1 for k in new_rooms if k[0]=='new' and k[3]==block_ref)
-                        if len(siblings)+added>MAX_ROOMS_PER_BLOCK:
-                            raise ValueError(f'Блок «{block_name}»: нельзя создать более '
-                                             f'{MAX_ROOMS_PER_BLOCK} комнат')
-            raw_tariff=record.get('tariff_id')
-            tariff_id=_excel_int(raw_tariff,'ID тарифа')
-            if tariff_id is not None:
-                tariff=tariffs.get(tariff_id)
-                if not tariff or int(tariff['building_id'])!=building_id or int(tariff['comfort_category_id'])!=category or int(tariff['room_capacity'])!=capacity:
-                    raise ValueError(f'ID тарифа (tariff_id={tariff_id}): тариф неактивен либо не подходит по общежитию, категории или вместимости')
-            unique=(key,bed_number.casefold())
-            if unique in seen or (room_id is not None and (room_id,bed_number.casefold()) in taken):
+                        siblings = {r['id'] for r in rooms if r['block_id'] == block_ref}
+                        added = sum(1 for k in new_rooms if k[0] == 'new' and k[3] == block_ref)
+                        if len(siblings) + added > 4:
+                            raise ValueError(f'Блок «{block_name}»: допускается максимум 4 комнаты')
+
+            # New template: organization-local tariff numbers (may be a comma-separated list).
+            # Legacy global tariff ID column is kept only for older workbooks.
+            number_values = _excel_tariff_numbers(record.get('tariff_numbers'))
+            legacy_id = _excel_int(record.get('tariff_id'), 'ID тарифа')
+            if number_values and legacy_id is not None:
+                raise ValueError('Тарифы: заполните только «Номера тарифов» (без «ID тарифа»)')
+            chosen_tariffs = []
+            if number_values:
+                for number in number_values:
+                    candidates = tariffs_by_number.get(number, [])
+                    if len(candidates) != 1:
+                        raise ValueError(f'Номер тарифа №{number}: ' +
+                                         ('не найден в вашей организации' if not candidates else 'несколько совпадений'))
+                    chosen_tariffs.append(candidates[0])
+            elif legacy_id is not None:
+                legacy = tariffs_by_id.get(legacy_id)
+                if not legacy:
+                    raise ValueError(f'ID тарифа (tariff_id={legacy_id}): не найден в вашей организации')
+                chosen_tariffs = [legacy]
+            for tariff in chosen_tariffs:
+                label = f'№{tariff["tariff_number"]}' if tariff.get('tariff_number') is not None else f'ID {tariff["id"]}'
+                if tariff.get('status', 'ACTIVE') != 'ACTIVE':
+                    raise ValueError(f'Тариф {label}: неактивен')
+                if (int(tariff['building_id']) != building_id or
+                    tariff['comfort_category_id'] is None or category is None or
+                    int(tariff['comfort_category_id']) != category or
+                    int(tariff['room_capacity']) != capacity):
+                    raise ValueError(f'Тариф {label}: не соответствует общежитию, категории комфортности или вместимости ({capacity})')
+            tariff_ids = [int(t['id']) for t in chosen_tariffs]
+            unique = (key, bed_number.casefold())
+            if unique in seen or (room_id is not None and (room_id, bed_number.casefold()) in taken):
                 raise ValueError(f'Номер койко-места «{bed_number}»: уже существует в комнате или файле')
             seen.add(unique)
-            counts[key]=counts.get(key,counts.get(room_id,0) if room_id else 0)+1
-            if counts[key]>capacity:
+            counts[key] = counts.get(key, counts.get(room_id, 0) if room_id else 0) + 1
+            if counts[key] > capacity:
                 raise ValueError(f'Комната: превышена вместимость {capacity} мест')
-            prepared.append((key,bed_number,gender,tariff_id))
+            prepared.append((key, bed_number, gender, tariff_ids))
         except ValueError as exc:
-            errors.append({'row':index,'error':str(exc)})
+            errors.append({'row': index, 'error': str(exc)})
     if errors:
-        return {'ok':False,'imported':0,'created_rooms':0,'created_blocks':0,
-                'total_errors':len(errors),'errors':errors[:100]}
+        return {'ok': False, 'imported': 0, 'created_rooms': 0, 'created_blocks': 0,
+                'total_errors': len(errors), 'errors': errors[:100]}
 
     try:
-        created={}
-        created_blocks={}
-        inserted_block_ids=[]
-        # Serialize imports within the floors, so concurrent Excel imports cannot
-        # independently create the same named block on the same floor.
-        involved_floors={details[1] for details in new_rooms.values()}
-        involved_floors.update(details[1] for details in new_blocks.values())
-        for floor_id in sorted(involved_floors):
-            db.execute(text("SELECT id FROM dorm_booking.floors WHERE id=:id AND organization_id=:org FOR UPDATE"),
-                       {'id':floor_id,'org':oid})
-
-        for block_key,(building_id,floor_id,name) in new_blocks.items():
-            # Recheck after the floor lock in case another import has committed
-            # the same block since our initial validation snapshot.
-            matches=rows(db,"""SELECT id FROM dorm_booking.blocks
-                WHERE organization_id=:org AND building_id=:b AND floor_id=:f
-                  AND lower(btrim(name))=:name ORDER BY id FOR UPDATE""",
-                org=oid,b=building_id,f=floor_id,name=name.casefold())
-            if len(matches)>1:
-                fail(f'Блок «{name}»: в БД уже есть несколько блоков с таким названием',409)
-            if matches:
-                created_blocks[block_key]=int(matches[0]['id'])
+        created_rooms, created_blocks = {}, {}
+        # Lock floors in sorted order so competing Excel uploads do not create two
+        # blocks/rooms on the same floor; uniqueness constraints remain authoritative.
+        touched = {data[1] for data in new_rooms.values()} | {data[1] for data in new_blocks.values()}
+        for floor_id in sorted(touched):
+            db.execute(text("""SELECT id FROM dorm_booking.floors
+                WHERE id=:id AND organization_id=:org FOR UPDATE"""), {'id': floor_id, 'org': oid})
+        for key, (building_id, floor_id, name) in new_blocks.items():
+            block_id = scalar(db, """INSERT INTO dorm_booking.blocks
+                 (organization_id,building_id,floor_id,name,gender_policy,status)
+                 VALUES (:org,:building,:floor,:name,'ANY','ACTIVE') RETURNING id""",
+                 org=oid, building=building_id, floor=floor_id, name=name)
+            code = f'SYS_BLOCK_{block_id}'
+            if scalar(db, """SELECT 1 FROM dorm_booking.blocks
+                 WHERE building_id=:building AND code=:code""", building=building_id, code=code):
+                code = 'SYS_BLOCK_' + secrets.token_hex(10).upper()
+            db.execute(text('UPDATE dorm_booking.blocks SET code=:code WHERE id=:id AND organization_id=:org'),
+                       {'code': code, 'id': block_id, 'org': oid})
+            created_blocks[key] = block_id
+        for key, (building_id, floor_id, block_ref, number, capacity, category) in new_rooms.items():
+            block_id = created_blocks[block_ref] if isinstance(block_ref, tuple) else block_ref
+            rid = scalar(db, """INSERT INTO dorm_booking.rooms
+                 (organization_id,building_id,floor_id,block_id,comfort_category_id,
+                  room_number,capacity,gender_policy,status)
+                 VALUES (:o,:b,:f,:block,:category,:num,:capacity,'ANY','ACTIVE') RETURNING id""",
+                 o=oid, b=building_id, f=floor_id, block=block_id,
+                 category=category, num=number, capacity=capacity)
+            created_rooms[key] = rid
+        for key, bed_number, gender, tariff_ids in prepared:
+            room_id = key[1] if key[0] == 'existing' else created_rooms[key]
+            if not tariff_ids:
+                db.execute(text("""INSERT INTO dorm_booking.beds
+                    (organization_id,room_id,bed_number,gender_policy,status)
+                    VALUES (:org,:room,:number,:gender,'DRAFT')"""),
+                    {'org': oid, 'room': room_id, 'number': bed_number, 'gender': gender})
                 continue
-            bid=scalar(db,"""INSERT INTO dorm_booking.blocks
-                (organization_id,building_id,floor_id,name,gender_policy,status)
-                VALUES (:org,:b,:f,:name,'ANY','ACTIVE') RETURNING id""",
-                org=oid,b=building_id,f=floor_id,name=name)
-            code=f'SYS_BLOCK_{bid}'
-            if scalar(db,"""SELECT 1 FROM dorm_booking.blocks
-                    WHERE building_id=:building AND code=:code AND id<>:id""",
-                    building=building_id,code=code,id=bid):
-                code='SYS_BLOCK_'+secrets.token_hex(10).upper()
-            db.execute(text("""UPDATE dorm_booking.blocks SET code=:code
-                WHERE id=:id AND organization_id=:org"""),
-                {'code':code,'id':bid,'org':oid})
-            created_blocks[block_key]=int(bid)
-            inserted_block_ids.append(int(bid))
-
-        for key,(building_id,floor_id,block_ref,number,capacity,category) in new_rooms.items():
-            block_id=created_blocks[block_ref] if isinstance(block_ref,tuple) else block_ref
-            rid=scalar(db,"""INSERT INTO dorm_booking.rooms
-                  (organization_id,building_id,floor_id,block_id,comfort_category_id,room_number,capacity,status)
-                  VALUES (:o,:b,:f,:block,:category,:num,:capacity,'ACTIVE') RETURNING id""",
-                  o=oid,b=building_id,f=floor_id,block=block_id,category=category,num=number,capacity=capacity)
-            created[key]=rid
-        for key,bed_number,gender,tariff_id in prepared:
-            rid=key[1] if key[0]=='existing' else created[key]
-            db.execute(text("""INSERT INTO dorm_booking.beds
+            bed_id = scalar(db, """INSERT INTO dorm_booking.beds
                 (organization_id,room_id,bed_number,gender_policy,tariff_id,status)
-                VALUES (:org,:room,:number,:gender,:tariff,'DRAFT')"""),
-                {'org':oid,'room':rid,'number':bed_number,'gender':gender,'tariff':tariff_id})
-        log(db,u,'IMPORT_BEDS','beds',None,'Импорт конкретных мест из Excel',
-            {'count':len(prepared),'created_rooms':len(created),
-             'created_blocks':len(inserted_block_ids),'new_block_ids':inserted_block_ids[:100]})
+                VALUES (:org,:room,:number,:gender,:tariff,'DRAFT') RETURNING id""",
+                org=oid, room=room_id, number=bed_number, gender=gender,
+                tariff=tariff_ids[0])
+            for tariff_id in tariff_ids:
+                db.execute(text("""INSERT INTO dorm_booking.bed_tariff_links
+                    (organization_id,bed_id,tariff_id) VALUES (:org,:bed,:tariff)"""),
+                    {'org': oid, 'bed': bed_id, 'tariff': tariff_id})
+        log(db, u, 'IMPORT_BEDS', 'beds', None, 'Импорт койко-мест из Excel',
+            {'count': len(prepared), 'created_rooms': len(created_rooms),
+             'created_blocks': len(created_blocks),
+             'assigned_tariff_links': sum(len(items[3]) for items in prepared)})
         db.commit()
-        return {'ok':True,'imported':len(prepared),'created_rooms':len(created),
-                'created_blocks':len(inserted_block_ids),
-                'assigned_tariffs':sum(tariff_id is not None for _,_,_,tariff_id in prepared),'errors':[]}
-    except HTTPException:
-        db.rollback()
-        raise
+        return {'ok': True, 'imported': len(prepared), 'created_rooms': len(created_rooms),
+                'created_blocks': len(created_blocks),
+                'assigned_tariffs': sum(bool(items[3]) for items in prepared),
+                'assigned_tariff_links': sum(len(items[3]) for items in prepared), 'errors': []}
     except SQLAlchemyError as exc:
         db.rollback()
         raise wrap_db_error(exc)
@@ -3056,6 +3344,74 @@ def amenity_list(q:str='',include_inactive:bool=False,db:Session=Depends(db_sess
       ORDER BY organization_id NULLS FIRST,name LIMIT 100""",o=oid,include_inactive=include_inactive,q='%'+q.lower()+'%',needle=q.lower())
 
 
+class AmenityChangeRequestIn(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+    amenity_group: str = 'OTHER'
+
+
+AMENITY_GROUPS = ('FURNITURE','PERSONAL_KIT','HALLWAY','KITCHEN','BATHROOM','INFRASTRUCTURE','OTHER')
+
+
+@app.get('/api/admin/amenity-requests')
+def admin_amenity_change_requests(db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    oid=org_admin(u)
+    if u.get('platform_support_mode'):
+        fail('Подача заявок на характеристики недоступна в режиме сопровождения',403)
+    return rows(db, """SELECT status,review_note,created_at,reviewed_at
+        FROM dorm_booking.amenity_change_requests
+        WHERE organization_id_snapshot=:org
+        ORDER BY created_at DESC,id DESC""", org=oid)
+
+
+@app.post('/api/admin/amenity-requests', status_code=201)
+def admin_submit_amenity_change_request(body:AmenityChangeRequestIn,
+        db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    oid=org_admin(u)
+    if u.get('platform_support_mode'):
+        fail('Подача заявок на характеристики недоступна в режиме сопровождения',403)
+    name=body.name.strip()
+    if len(name)<2:
+        fail('Название характеристики должно содержать не менее двух символов',422)
+    if body.amenity_group not in AMENITY_GROUPS:
+        fail('Неизвестная группа оснащения',422)
+    org=row(db, 'SELECT id,short_name FROM dorm_booking.organizations WHERE id=:id', id=oid)
+    if not org:
+        fail('Организация не найдена',404)
+    existing=row(db, """SELECT id,name FROM dorm_booking.amenity_definitions
+        WHERE (organization_id=:org OR organization_id IS NULL)
+          AND lower(btrim(name))=lower(btrim(:name)) LIMIT 1""", org=oid, name=name)
+    if existing:
+        fail(f'Характеристика «{existing["name"]}» уже есть в справочнике',409)
+    pending=row(db, """SELECT id FROM dorm_booking.amenity_change_requests
+        WHERE organization_id_snapshot=:org AND status='PENDING'
+          AND lower(btrim(name))=lower(btrim(:name)) LIMIT 1""", org=oid, name=name)
+    if pending:
+        fail('Заявка с таким названием уже находится на рассмотрении',409)
+    full_name=' '.join(str(u.get(k) or '').strip() for k in ('last_name','first_name','middle_name')).strip()
+    try:
+        request=row(db, """INSERT INTO dorm_booking.amenity_change_requests
+          (organization_id,organization_id_snapshot,organization_short_name_snapshot,
+           submitted_by_user_id,submitted_by_user_id_snapshot,submitted_by_login_snapshot,
+           submitted_by_name_snapshot,name,amenity_group,status)
+          VALUES (:org,:org_snapshot,:org_name,:user_id,:user_snapshot,:login,:full_name,
+                  :name,:grp,'PENDING')
+          RETURNING id,status,created_at""",
+          org=oid,org_snapshot=oid,org_name=org['short_name'],user_id=u['id'],
+          user_snapshot=u['id'],login=u.get('login') or '',full_name=full_name,
+          name=name,grp=body.amenity_group)
+        log(db,u,'AMENITY_CHANGE_REQUEST_SUBMITTED','amenity_change_requests',request['id'],
+            f'Заявка на характеристику «{name}» направлена на модерацию',
+            {'amenity_group':body.amenity_group,'organization_id':oid},org_id=oid)
+        db.commit()
+        return request
+    except IntegrityError:
+        db.rollback()
+        fail('Такая заявка уже находится на рассмотрении',409)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise wrap_db_error(exc)
+
+
 class AmenityIn(BaseModel):
     code:Optional[str]=None
     name:str
@@ -3064,32 +3420,12 @@ class AmenityIn(BaseModel):
 
 @app.post('/api/admin/amenities')
 def add_amenity(body:AmenityIn,db:Session=Depends(db_session),u:dict=Depends(current_user)):
-    oid=org_admin(u)
-    similar=rows(db,"""SELECT id,name,code FROM dorm_booking.amenity_definitions WHERE is_active
-      AND (organization_id IS NULL OR organization_id=:org)
-      AND lower(name)=lower(:name)""",
-       org=oid,name=body.name.strip())
-    if similar:
-        fail('Такая характеристика уже существует: '+similar[0]['name'],409)
-    if body.amenity_group not in ('FURNITURE','PERSONAL_KIT','HALLWAY','KITCHEN','BATHROOM','INFRASTRUCTURE','OTHER'):
-        fail('Неизвестная группа оснащения')
-    try:
-        code = 'SYS_AMENITY_' + secrets.token_hex(12).upper()
-        aid=scalar(db,"""INSERT INTO dorm_booking.amenity_definitions(organization_id,code,name,amenity_group)
-          VALUES(:o,:code,:name,:grp) RETURNING id""",o=oid,code=code,name=body.name.strip(),grp=body.amenity_group)
-        generated_code=f'SYS_AMENITY_{aid}'
-        if scalar(db, '''SELECT 1 FROM dorm_booking.amenity_definitions
-                        WHERE organization_id=:org AND lower(code)=lower(:code)''',
-                  org=oid, code=generated_code):
-            generated_code='SYS_AMENITY_'+secrets.token_hex(12).upper()
-        db.execute(text('UPDATE dorm_booking.amenity_definitions SET code=:code WHERE id=:id'),
-                   {'code':generated_code, 'id':aid})
-        log(db,u,'AMENITY_CREATED','amenity_definitions',aid,body.name)
-        db.commit()
-        return {'id':aid}
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise wrap_db_error(e)
+    # Direct organization-local creation is intentionally disabled in v6.33.
+    # New characteristics must pass platform moderation before entering the catalog.
+    org_admin(u)
+    if u.get('platform_support_mode'):
+        fail('Подача заявок на характеристики недоступна в режиме сопровождения',403)
+    fail('Новые характеристики добавляются через заявку на модерацию: POST /api/admin/amenity-requests',409)
 
 
 class AmenityEdit(BaseModel):
@@ -3232,7 +3568,8 @@ def admin_remove_amenity(assignment_id:int,
 @app.get('/api/admin/users')
 def admin_users(db:Session=Depends(db_session),u:dict=Depends(current_user)):
     return rows(db,"""SELECT id,login,concat_ws(' ',last_name,first_name,middle_name) AS full_name,email,gender,role,education_basis,citizenship_category,
-      study_end_date,study_status,status FROM dorm_booking.users WHERE organization_id=:o ORDER BY id DESC""",o=org_admin(u))
+      study_end_date,study_status,status FROM dorm_booking.users WHERE organization_id=:o
+      AND deleted_at IS NULL ORDER BY id DESC""",o=org_admin(u))
 
 
 def budget_study_end_required(db: Session, organization_id: int) -> bool:
@@ -3244,7 +3581,7 @@ def budget_study_end_required(db: Session, organization_id: int) -> bool:
     rules = rows(db, """SELECT budget_requires_study_end
                     FROM dorm_booking.booking_rules WHERE organization_id=:o""",
                  o=organization_id)
-    return bool(rules and rules[0]['budget_requires_study_end'])
+    return bool(rules and rules[0].get('budget_requires_study_end', False))
 
 
 class NewStudentIn(BaseModel):
@@ -3324,7 +3661,7 @@ def admin_student_status(user_id:int,body:StudentStatusIn,
 
 
 def _excel_date_value(value):
-    """Excel numeric serial/date/string -> ISO date; never parse enum fields as dates."""
+    """Read DD.MM.YYYY, real Excel dates and legacy ISO strings without ambiguous parsing."""
     from datetime import datetime as _datetime, date as _date
     from openpyxl.utils.datetime import from_excel
     if value is None or str(value).strip() == '':
@@ -3340,10 +3677,16 @@ def _excel_date_value(value):
         if not isinstance(result, (_datetime, _date)):
             raise ValueError('числовая дата Excel некорректна')
         return result.date() if isinstance(result, _datetime) else result
+    value = str(value).strip()
     try:
-        return _date.fromisoformat(str(value).strip()[:10])
-    except (ValueError, TypeError) as exc:
-        raise ValueError('укажите дату YYYY-MM-DD или ячейку Excel с датой') from exc
+        if re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', value):
+            return _datetime.strptime(value, '%d.%m.%Y').date()
+        # Retain compatibility with previously generated templates.
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            return _date.fromisoformat(value)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError('некорректная календарная дата, используйте ДД.ММ.ГГГГ') from exc
+    raise ValueError('укажите дату ДД.ММ.ГГГГ или ячейку Excel с датой')
 
 
 def _excel_headers(values, required, translations=None):
@@ -3408,10 +3751,19 @@ async def import_users(file: UploadFile=File(...),db:Session=Depends(db_session)
                       'STUDYING':'STUDYING','GRADUATED':'GRADUATED',
                       'EXPELLED':'EXPELLED','INACTIVE':'INACTIVE'},
     }
+    # Labels changed by the platform are accepted immediately by XLSX validation.
+    available_references = {item['code']:item['values'] for item in reference_options(db)}
+    for dictionary in valid:
+        labels[dictionary].update({item['label'].strip().upper():item['code']
+                                   for item in available_references[dictionary]})
     russian_options={'gender':'Мужской, Женский',
       'citizenship_category':'Россия, Иностранное',
       'education_basis':'Бюджет, Платное',
       'study_status':'Обучается, Завершил обучение, Отчислен, Не обучается'}
+    russian_options={dictionary: ', '.join(
+        option['label'] for option in available_references[dictionary]
+        if option['code'] in allowed)
+        for dictionary, allowed in valid.items()}
     errors=[];prepared=[];seen=set()
     require_budget_end=budget_study_end_required(db, oid)
     existing={x['login'] for x in rows(db,'SELECT lower(login) AS login FROM dorm_booking.users WHERE organization_id=:o',o=oid)}
@@ -3424,7 +3776,7 @@ async def import_users(file: UploadFile=File(...),db:Session=Depends(db_session)
         for field, options in valid.items():
             value=_excel_choice(values.get(field,''),labels[field])
             if value not in options:
-                problems.append(f'{field}: значение «{values.get(field, "")}» недопустимо; варианты: {russian_options[field]} ({", ".join(options)})')
+                problems.append(f'{field}: значение «{values.get(field, "")}» недопустимо; варианты: {russian_options[field]}')
             values[field]=value
         login=values.get('login','')
         if login and login.casefold() in seen:
@@ -3804,7 +4156,7 @@ def edit_tariff(tariff_id:int,body:TariffIn,db:Session=Depends(db_session),u:dic
     attached=int(scalar(db,"SELECT count(*) FROM dorm_booking.bed_tariff_links WHERE tariff_id=:id AND organization_id=:org",id=tariff_id,org=oid) or 0)
     pool_attached=int(scalar(db,"SELECT count(*) FROM dorm_booking.quota_pool_tariff_links WHERE tariff_id=:id AND organization_id=:org",id=tariff_id,org=oid) or 0)
     if structure_changed and (attached or pool_attached):
-        fail(f'Тариф назначен объектам размещения: койко-местам — {attached}, пулам — {pool_attached}. Сначала переназначьте его, затем измените общежитие, категорию или вместимость.',409)
+        fail(f'Тариф назначен объектам размещения: койко-местам - {attached}, пулам - {pool_attached}. Сначала переназначьте его, затем измените общежитие, категорию или вместимость.',409)
     if not scalar(db,"SELECT 1 FROM dorm_booking.buildings WHERE id=:id AND organization_id=:org",id=body.building_id,org=oid):
         fail('Общежитие не относится к организации',422)
     if not scalar(db,"SELECT 1 FROM dorm_booking.comfort_categories WHERE id=:id AND organization_id=:org",id=body.category_id,org=oid):
@@ -3867,10 +4219,31 @@ def org_logs(db:Session=Depends(db_session),u:dict=Depends(current_user)):
 @app.get('/api/platform/organizations')
 def platform_orgs(db:Session=Depends(db_session),u:dict=Depends(current_user)):
     roles(u,'PLATFORM_ADMIN')
-    return rows(db,"""SELECT o.*, (SELECT count(*) FROM dorm_booking.buildings b WHERE b.organization_id=o.id)::INTEGER AS buildings,
-      (SELECT count(*) FROM dorm_booking.users a WHERE a.organization_id=o.id AND a.role='ORG_ADMIN')::INTEGER AS admins,
-      (SELECT count(*) FROM dorm_booking.beds p WHERE p.organization_id=o.id AND p.status='ACTIVE')::INTEGER AS published
+    return rows(db,"""SELECT o.*,
+      (SELECT count(*) FROM dorm_booking.buildings b WHERE b.organization_id=o.id)::INTEGER AS buildings,
+      (SELECT count(*) FROM dorm_booking.users a WHERE a.organization_id=o.id AND a.role='ORG_ADMIN'
+        AND a.deleted_at IS NULL)::INTEGER AS admins,
+      (SELECT count(*) FROM dorm_booking.users a WHERE a.organization_id=o.id AND a.status='ACTIVE')::INTEGER AS active_users,
+      (SELECT count(*) FROM dorm_booking.users a WHERE a.organization_id=o.id)::INTEGER AS users_total,
+      (SELECT count(*) FROM dorm_booking.users a WHERE a.organization_id=o.id AND a.role='STUDENT')::INTEGER AS student_users,
+      (SELECT count(*) FROM dorm_booking.users a WHERE a.organization_id=o.id AND a.role='ARCHIVED_ADMIN')::INTEGER AS archived_admins,
+      (SELECT count(*) FROM dorm_booking.bookings bk WHERE bk.organization_id=o.id)::INTEGER AS bookings_total,
+      (SELECT count(*) FROM dorm_booking.bookings bk WHERE bk.organization_id=o.id
+        AND bk.status IN ('PENDING_ADMIN','CONFIRMED'))::INTEGER AS active_bookings,
+      (SELECT count(*) FROM dorm_booking.beds b WHERE b.organization_id=o.id AND b.status='ACTIVE'
+        AND NOT EXISTS (SELECT 1 FROM dorm_booking.quota_pool_beds pb
+            JOIN dorm_booking.quota_pools pool ON pool.id=pb.pool_id
+            WHERE pb.bed_id=b.id AND pool.status='ACTIVE' AND pool.deleted_at IS NULL))::INTEGER AS published_beds,
+      (SELECT COALESCE(SUM(pool.quantity),0) FROM dorm_booking.quota_pools pool
+         WHERE pool.organization_id=o.id AND pool.status='ACTIVE' AND pool.deleted_at IS NULL)::INTEGER AS published_quota,
+      ((SELECT count(*) FROM dorm_booking.beds b WHERE b.organization_id=o.id AND b.status='ACTIVE'
+        AND NOT EXISTS (SELECT 1 FROM dorm_booking.quota_pool_beds pb
+            JOIN dorm_booking.quota_pools pool ON pool.id=pb.pool_id
+            WHERE pb.bed_id=b.id AND pool.status='ACTIVE' AND pool.deleted_at IS NULL))
+        + (SELECT COALESCE(SUM(pool.quantity),0) FROM dorm_booking.quota_pools pool
+          WHERE pool.organization_id=o.id AND pool.status='ACTIVE' AND pool.deleted_at IS NULL))::INTEGER AS published
       FROM dorm_booking.organizations o ORDER BY o.id""")
+
 
 
 class OrgIn(BaseModel):
@@ -4041,7 +4414,9 @@ def platform_org_delete(organization_id: int,
           AND n.nspname='dorm_booking' AND a.attname<>'id' ''')
     blockers=[]
     for fk in dependent_fks:
-        if fk['table_name']=='activity_logs':
+        # Audit and moderation requests retain immutable organization snapshots;
+        # their nullable foreign keys are detached automatically on deletion.
+        if fk['table_name'] in ('activity_logs','platform_support_sessions','amenity_change_requests'):
             continue
         # Identifiers originate from PostgreSQL's own pg_catalog, not user input.
         safe_ident = lambda x: '"' + x.replace('"','""') + '"'
@@ -4051,13 +4426,25 @@ def platform_org_delete(organization_id: int,
         if exists:
             blockers.append(ORG_DEPENDENCY_LABELS.get(fk['table_name'], fk['table_name']))
     if blockers:
-        readable=', '.join(sorted(set(blockers))[:6])
+        if 'пользователи' in blockers:
+            counts=row(db, """SELECT count(*) AS total,
+                count(*) FILTER (WHERE role='STUDENT') AS students,
+                count(*) FILTER (WHERE role='ORG_ADMIN') AS administrators,
+                count(*) FILTER (WHERE role='ARCHIVED_ADMIN') AS archived
+                FROM dorm_booking.users WHERE organization_id=:org""", org=organization_id)
+            blockers.remove('пользователи')
+            blockers.insert(0, f"пользователи (всего {counts.get('total', 0)}, студентов {counts.get('students', 0)}, " +
+                f"администраторов {counts.get('administrators', 0)}, архивных администраторов {counts.get('archived', 0)})")
+        readable=', '.join(dict.fromkeys(blockers))
         fail('Невозможно удалить организацию, пока с ней связаны данные: '+readable+
-             '. Сохраните историю: отключите организацию вместо удаления.',409)
+             '. Чтобы сохранить историю бронирований и пользователей, оставьте организацию отключённой.',409)
     try:
         # activity_logs.organization_id is nullable; preserve original events.
         db.execute(text('UPDATE dorm_booking.activity_logs SET organization_id=NULL WHERE organization_id=:id'),
                    {'id':organization_id})
+        db.execute(text('''UPDATE dorm_booking.platform_support_sessions
+            SET ended_at=now() WHERE organization_id=:id AND ended_at IS NULL'''),
+            {'id':organization_id})
         db.execute(text('DELETE FROM dorm_booking.organizations WHERE id=:id'),{'id':organization_id})
         log(db,u,'ORGANIZATION_DELETED','organizations',organization_id,
             'Удалена пустая организация '+current['short_name'])
@@ -4072,11 +4459,116 @@ def platform_org_delete(organization_id: int,
 def platform_admin_list(db:Session=Depends(db_session),u:dict=Depends(current_user)):
     roles(u,'PLATFORM_ADMIN')
     return rows(db,"""SELECT a.id,a.organization_id,a.login,a.last_name,a.first_name,
-           a.middle_name,a.status,o.short_name AS organization_name,o.name AS full_organization_name
+           a.middle_name,a.status,o.short_name AS organization_name,o.name AS full_organization_name,
+           o.status AS organization_status,admin_stats.admin_count,
+           (admin_stats.admin_count=1) AS is_last_admin,
+           (admin_stats.admin_count=1 AND o.status='INACTIVE') AS can_delete_last_admin,
+           (admin_stats.active_admin_count=1 AND a.status='ACTIVE') AS is_last_active_admin
            FROM dorm_booking.users a
            JOIN dorm_booking.organizations o ON o.id=a.organization_id
-           WHERE a.role='ORG_ADMIN' ORDER BY o.short_name,a.last_name,a.id""")
+           JOIN LATERAL (SELECT count(*)::INTEGER AS admin_count,
+                 count(*) FILTER (WHERE x.status='ACTIVE')::INTEGER AS active_admin_count
+               FROM dorm_booking.users x WHERE x.organization_id=a.organization_id
+                 AND x.role='ORG_ADMIN' AND x.deleted_at IS NULL) admin_stats ON TRUE
+           WHERE a.role='ORG_ADMIN' AND a.deleted_at IS NULL
+           ORDER BY o.short_name,a.last_name,a.id""")
 
+
+class PlatformAdminStatusIn(BaseModel):
+    status: str
+
+
+@app.put('/api/platform/admins/{user_id}/status')
+def platform_admin_status(user_id:int, body:PlatformAdminStatusIn,
+                          db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u,'PLATFORM_ADMIN')
+    if body.status not in ('ACTIVE','BLOCKED'):
+        fail('Допустимый статус администратора: ACTIVE или BLOCKED',422)
+    # Serialize all administrator mutations of the same organization.
+    org = row(db, '''SELECT o.id,o.status FROM dorm_booking.organizations o
+        JOIN dorm_booking.users a ON a.organization_id=o.id
+        WHERE a.id=:id AND a.role='ORG_ADMIN' AND a.deleted_at IS NULL
+        FOR UPDATE OF o''', id=user_id)
+    if not org:
+        fail('Администратор организации не найден',404)
+    target = row(db, '''SELECT id,organization_id,login,status FROM dorm_booking.users
+        WHERE id=:id AND role='ORG_ADMIN' AND deleted_at IS NULL FOR UPDATE''', id=user_id)
+    if not target:
+        fail('Администратор организации не найден',404)
+    if target['status'] == body.status:
+        return {'ok':True,'unchanged':True}
+    if body.status == 'BLOCKED' and target['status'] == 'ACTIVE' and org['status']=='ACTIVE':
+        active_count = scalar(db, """SELECT count(*) FROM dorm_booking.users
+            WHERE organization_id=:org AND role='ORG_ADMIN'
+              AND status='ACTIVE' AND deleted_at IS NULL""", org=org['id'])
+        if int(active_count or 0) <= 1:
+            fail('Нельзя заблокировать последнего активного администратора действующей организации. Сначала отключите организацию или назначьте другого активного администратора.',409)
+    try:
+        db.execute(text('UPDATE dorm_booking.users SET status=:status,updated_at=now() WHERE id=:id'),
+                   {'status': body.status, 'id': user_id})
+        log(db,u,'ORG_ADMIN_STATUS_CHANGED','users',user_id,
+            f"Статус администратора {target['login']} изменён",
+            {'before': target['status'], 'after': body.status},
+            org_id=target['organization_id'])
+        db.commit()
+        return {'ok':True}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise wrap_db_error(exc)
+
+
+@app.delete('/api/platform/admins/{user_id}')
+def platform_admin_delete(user_id:int, db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u,'PLATFORM_ADMIN')
+    # Preserve the row for audit/booking FKs. ARCHIVED_ADMIN grants no permissions.
+    org = row(db, '''SELECT o.id,o.status FROM dorm_booking.organizations o
+        JOIN dorm_booking.users a ON a.organization_id=o.id
+        WHERE a.id=:id AND a.role='ORG_ADMIN' AND a.deleted_at IS NULL
+        FOR UPDATE OF o''', id=user_id)
+    if not org:
+        fail('Администратор организации не найден',404)
+    current = row(db, '''SELECT id,organization_id,login,status
+        FROM dorm_booking.users
+        WHERE id=:id AND role='ORG_ADMIN' AND deleted_at IS NULL FOR UPDATE''', id=user_id)
+    if not current:
+        fail('Администратор организации не найден',404)
+    admin_count = scalar(db, """SELECT count(*) FROM dorm_booking.users
+        WHERE organization_id=:org AND role='ORG_ADMIN' AND deleted_at IS NULL""", org=org['id'])
+    active_count = scalar(db, """SELECT count(*) FROM dorm_booking.users
+        WHERE organization_id=:org AND role='ORG_ADMIN'
+          AND status='ACTIVE' AND deleted_at IS NULL""", org=org['id'])
+    is_last_admin = int(admin_count or 0) == 1
+    if org['status']=='ACTIVE' and (is_last_admin or
+            (current['status']=='ACTIVE' and int(active_count or 0) <= 1)):
+        fail('Нельзя удалить последнего администратора действующей организации. Сначала отключите организацию или назначьте другого активного администратора.',409)
+
+    # bed_periods.existing_user_id has a composite FK (id, organization_id).
+    # Keep the organization ID if needed by historical references; otherwise
+    # detach so this archived row does not block deletion of an empty organization.
+    has_tenant_reference = bool(scalar(db, """SELECT EXISTS (
+        SELECT 1 FROM dorm_booking.bed_periods
+        WHERE existing_user_id=:id AND organization_id=:org)""",
+        id=user_id,org=org['id']))
+    archived_login = f'archived_org_admin_{user_id}_{secrets.token_hex(6)}'
+    try:
+        db.execute(text('''UPDATE dorm_booking.users SET
+            organization_id=:archived_org, role='ARCHIVED_ADMIN',status='BLOCKED',
+            deleted_at=now(),archived_login=login,login=:archived_login,updated_at=now()
+            WHERE id=:id AND deleted_at IS NULL'''),
+            {'archived_org':org['id'] if has_tenant_reference else None,
+             'archived_login':archived_login, 'id':user_id})
+        log(db,u,'ORG_ADMIN_DELETED','users',user_id,
+            'Администратор исключён из организации; вход заблокирован, исторический ID сохранён',
+            {'deleted_admin_login':current['login'],'organization_id':org['id'],
+             'history_identity_preserved':True,'account_blocked':True,
+             'archived_user_id':user_id,'tenant_reference_preserved':has_tenant_reference},
+            org_id=org['id'])
+        db.commit()
+        return {'ok':True,'id':user_id,'deleted':True,'history_identity_preserved':True,
+                'detached_from_organization':not has_tenant_reference}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise wrap_db_error(exc)
 
 class PlatformOrganizationStatus(BaseModel):
     status: str
@@ -4089,20 +4581,28 @@ def platform_organization_status(organization_id:int, body:PlatformOrganizationS
     roles(u,'PLATFORM_ADMIN')
     if body.status not in ('ACTIVE','INACTIVE'):
         fail('Допустимый статус организации: ACTIVE или INACTIVE')
-    existing=row(db,'SELECT id,status FROM dorm_booking.organizations WHERE id=:id',id=organization_id)
+    existing=row(db,'SELECT id,status FROM dorm_booking.organizations WHERE id=:id FOR UPDATE',id=organization_id)
     if not existing:
         fail('Организация не найдена',404)
-    if body.status=='INACTIVE':
-        ongoing=scalar(db,"""SELECT EXISTS (
-           SELECT 1 FROM dorm_booking.bookings bk
-           WHERE bk.organization_id=:id AND bk.status IN ('PENDING_ADMIN','CONFIRMED'))""",id=organization_id)
-        if ongoing:
-            fail('Сначала завершите или отмените действующие заявки организации',409)
+    if body.status=='INACTIVE' and not (body.reason or '').strip():
+        fail('Укажите причину отключения организации для журнала действий',422)
+    if body.status=='ACTIVE' and existing['status']!='ACTIVE':
+        active_admins=scalar(db, """SELECT count(*) FROM dorm_booking.users
+            WHERE organization_id=:org AND role='ORG_ADMIN' AND status='ACTIVE'
+              AND deleted_at IS NULL""", org=organization_id)
+        if not active_admins:
+            fail('Перед включением организации создайте или разблокируйте хотя бы одного администратора.',409)
     try:
         db.execute(text('UPDATE dorm_booking.organizations SET status=:s WHERE id=:id'),
                    {'s':body.status,'id':organization_id})
+        if body.status=='ACTIVE':
+            db.execute(text('''UPDATE dorm_booking.platform_support_sessions
+                SET ended_at=now() WHERE organization_id=:id AND ended_at IS NULL'''),
+                {'id':organization_id})
         log(db,u,'ORGANIZATION_STATUS_CHANGED','organizations',organization_id,
-            body.reason or body.status,org_id=organization_id)
+            (body.reason or body.status).strip(),
+            {'before':existing['status'],'after':body.status,'active_bookings_preserved':True},
+            org_id=organization_id)
         db.commit()
         return {'ok':True}
     except SQLAlchemyError as exc:
@@ -4110,11 +4610,597 @@ def platform_organization_status(organization_id:int, body:PlatformOrganizationS
         raise wrap_db_error(exc)
 
 
+
+class PlatformSupportEnter(BaseModel):
+    reason: str = Field(min_length=10,max_length=500)
+
+
+@app.post('/api/platform/organizations/{organization_id}/support-enter')
+def platform_support_enter(organization_id:int, body:PlatformSupportEnter,
+                           response:Response,db:Session=Depends(db_session),
+                           u:dict=Depends(current_user)):
+    roles(u,'PLATFORM_ADMIN')
+    target=row(db, "SELECT id,status,name FROM dorm_booking.organizations WHERE id=:id FOR UPDATE",
+               id=organization_id)
+    if not target:
+        fail('Организация не найдена',404)
+    if target['status']!='INACTIVE':
+        fail('Режим поддержки доступен только для отключённой организации',409)
+    if len(body.reason.strip()) < 10:
+        fail('Укажите содержательную причину сопровождения: не менее 10 символов',422)
+    # One live support context per platform administrator. Revoking a prior
+    # context prevents an old cookie from being used against another org.
+    db.execute(text('''UPDATE dorm_booking.platform_support_sessions
+       SET ended_at=now() WHERE actor_user_id=:actor AND ended_at IS NULL'''),
+       {'actor':u['id']})
+    token=secrets.token_urlsafe(48)
+    token_hash=hashlib.sha256(token.encode()).hexdigest()
+    db.execute(text('''INSERT INTO dorm_booking.platform_support_sessions
+       (token_hash,actor_user_id,organization_id,target_organization_id,reason,expires_at)
+       VALUES (:token,:actor,:org,:org,:reason,now()+INTERVAL '4 hours')'''),
+       {'token':token_hash,'actor':u['id'],'org':organization_id,'reason':body.reason.strip()})
+    log(db,u,'PLATFORM_SUPPORT_ENTER','organizations',organization_id,
+        'Вход в отключённую организацию для сопровождения',
+        {'reason':body.reason.strip()},org_id=organization_id)
+    db.commit()
+    response.set_cookie(COOKIE, serializer.dumps({
+        'id':u['id'],'password_stamp':hashlib.sha256(u['password_hash'].encode()).hexdigest()[:24],
+        'platform_support_token':token}),httponly=True,secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,max_age=min(SESSION_TTL,14400),path='/')
+    return {'ok':True,'organization_id':organization_id,'organization_name':target['name']}
+
+
+@app.post('/api/platform/support/exit')
+def platform_support_exit(request:Request,response:Response,db:Session=Depends(db_session)):
+    cookie=request.cookies.get(COOKIE)
+    if not cookie:
+        fail('Требуется вход в систему',401)
+    try:
+        identity=serializer.loads(cookie,max_age=SESSION_TTL)
+    except (BadSignature,SignatureExpired):
+        fail('Сессия недействительна',401)
+    u=row(db,'SELECT * FROM dorm_booking.users WHERE id=:id',id=int(identity['id']))
+    if not u or u['role']!='PLATFORM_ADMIN' or u['status']!='ACTIVE':
+        fail('Недостаточно прав',403)
+    if identity.get('password_stamp')!=hashlib.sha256((u.get('password_hash') or '').encode()).hexdigest()[:24]:
+        fail('Сессия устарела',401)
+    support_token=identity.get('platform_support_token')
+    if support_token:
+        token_hash=hashlib.sha256(str(support_token).encode()).hexdigest()
+        support=row(db, '''UPDATE dorm_booking.platform_support_sessions
+           SET ended_at=now() WHERE token_hash=:token AND actor_user_id=:actor
+           AND ended_at IS NULL RETURNING target_organization_id''',token=token_hash,actor=u['id'])
+        if support:
+            log(db,u,'PLATFORM_SUPPORT_EXIT','organizations',support['target_organization_id'],
+                'Завершена работа в режиме сопровождения',org_id=support['target_organization_id'])
+    db.commit()
+    response.set_cookie(COOKIE,serializer.dumps({
+        'id':u['id'],'password_stamp':hashlib.sha256(u['password_hash'].encode()).hexdigest()[:24]}),
+        httponly=True,secure=COOKIE_SECURE,samesite=COOKIE_SAMESITE,
+        max_age=SESSION_TTL,path='/')
+    return {'ok':True}
+
+class AmenityChangeDecision(BaseModel):
+    status: str
+    review_note: Optional[str] = Field(default=None, max_length=2000)
+
+
+@app.get('/api/platform/amenity-requests')
+def platform_amenity_change_requests(status:Optional[str]=None,
+        db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u,'PLATFORM_ADMIN')
+    if status and status not in ('PENDING','APPROVED','REJECTED'):
+        fail('Неизвестный статус заявки',422)
+    params={}
+    where=''
+    if status:
+        where='WHERE r.status=:status'
+        params['status']=status
+    return rows(db, """SELECT r.id,r.organization_id_snapshot AS organization_id,
+        r.organization_short_name_snapshot AS organization_short_name,
+        r.submitted_by_user_id_snapshot AS submitted_by_user_id,
+        r.submitted_by_login_snapshot AS submitted_by_login,
+        r.submitted_by_name_snapshot AS submitted_by_name,
+        r.name,r.amenity_group,r.status,r.review_note,
+        r.reviewed_by_user_id_snapshot AS reviewed_by_user_id,
+        r.reviewed_by_login_snapshot AS reviewed_by_login,
+        r.reviewed_by_name_snapshot AS reviewed_by_name,
+        r.created_at,r.reviewed_at,r.created_amenity_id
+        FROM dorm_booking.amenity_change_requests r
+        LEFT JOIN dorm_booking.organizations o ON o.id=r.organization_id
+        """+where+""" ORDER BY CASE r.status WHEN 'PENDING' THEN 0 WHEN 'REJECTED' THEN 1 ELSE 2 END,
+        r.created_at DESC,r.id DESC""", **params)
+
+
+@app.put('/api/platform/amenity-requests/{request_id}')
+def platform_decide_amenity_change_request(request_id:int,body:AmenityChangeDecision,
+        db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u,'PLATFORM_ADMIN')
+    if body.status not in ('APPROVED','REJECTED'):
+        fail('Допустимое решение: APPROVED или REJECTED',422)
+    note=(body.review_note or '').strip()
+    if body.status=='REJECTED' and not note:
+        fail('Для отклонения заявки обязательно укажите причину',422)
+    try:
+        request=row(db, """SELECT * FROM dorm_booking.amenity_change_requests
+            WHERE id=:id FOR UPDATE""", id=request_id)
+        if not request:
+            fail('Заявка на характеристику не найдена',404)
+        if request['status']!='PENDING':
+            fail('Заявка уже рассмотрена. Обновите список, чтобы увидеть актуальное решение.',409)
+        amenity_id=None
+        if body.status=='APPROVED':
+            org_id=request.get('organization_id')
+            if not org_id or not row(db,'SELECT id FROM dorm_booking.organizations WHERE id=:id',id=org_id):
+                fail('Организация, подавшая заявку, уже удалена. Нельзя добавить характеристику в её справочник.',409)
+            existing=row(db, """SELECT id,is_active,amenity_group FROM dorm_booking.amenity_definitions
+                WHERE (organization_id=:org OR organization_id IS NULL)
+                  AND lower(btrim(name))=lower(btrim(:name))
+                ORDER BY CASE WHEN organization_id=:org THEN 0 ELSE 1 END LIMIT 1 FOR UPDATE""",
+                org=org_id,name=request['name'])
+            if existing:
+                if existing['amenity_group'] != request['amenity_group']:
+                    fail('Характеристика с таким названием уже существует в другой группе. Проверьте общий справочник.',409)
+                amenity_id=existing['id']
+                if not existing['is_active']:
+                    db.execute(text('UPDATE dorm_booking.amenity_definitions SET is_active=true WHERE id=:id'),
+                               {'id':amenity_id})
+            else:
+                code='SYS_AMENITY_'+secrets.token_hex(12).upper()
+                amenity_id=scalar(db, """INSERT INTO dorm_booking.amenity_definitions
+                    (organization_id,code,name,amenity_group)
+                    VALUES (:org,:code,:name,:grp) RETURNING id""",
+                    org=org_id,code=code,name=request['name'],grp=request['amenity_group'])
+                generated_code=f'SYS_AMENITY_{amenity_id}'
+                if scalar(db, '''SELECT 1 FROM dorm_booking.amenity_definitions
+                    WHERE organization_id=:org AND lower(code)=lower(:code)''',
+                    org=org_id,code=generated_code):
+                    generated_code='SYS_AMENITY_'+secrets.token_hex(12).upper()
+                db.execute(text('UPDATE dorm_booking.amenity_definitions SET code=:code WHERE id=:id'),
+                           {'code':generated_code,'id':amenity_id})
+        reviewer_name=' '.join(str(u.get(k) or '').strip() for k in ('last_name','first_name','middle_name')).strip()
+        db.execute(text("""UPDATE dorm_booking.amenity_change_requests SET
+            status=:status,reviewed_by_user_id=:reviewer,reviewed_by_user_id_snapshot=:reviewer_snapshot,
+            reviewed_by_login_snapshot=:reviewer_login,reviewed_by_name_snapshot=:reviewer_name,
+            review_note=:note,created_amenity_id=:amenity,reviewed_at=now(),updated_at=now()
+            WHERE id=:id"""),
+            {'status':body.status,'reviewer':u['id'],'reviewer_snapshot':u['id'],
+             'reviewer_login':u.get('login') or '', 'reviewer_name':reviewer_name,
+             'note':note or None,'amenity':amenity_id,'id':request_id})
+        log(db,u,'AMENITY_CHANGE_REQUEST_REVIEWED','amenity_change_requests',request_id,
+            'Заявка на характеристику '+('одобрена' if body.status=='APPROVED' else 'отклонена'),
+            {'status':body.status,'organization_id':request['organization_id_snapshot'],
+             'amenity_id':amenity_id,'review_note':note or None},
+            org_id=request['organization_id_snapshot'])
+        db.commit()
+        return {'ok':True,'id':request_id,'status':body.status,'amenity_id':amenity_id}
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise wrap_db_error(exc)
+
+
+# System reference codes are stable DB contract values. Only their Russian labels are editable.
+# The same registry powers web forms, Excel imports and generated templates.
+# Only these display labels are subject to organization proposals and platform edits.
+REFERENCE_REVIEWABLE = frozenset({
+    'citizenship_category', 'education_basis', 'occupant_category', 'study_status',
+    'building_type', 'amenity_group', 'organization_type',
+})
+REFERENCE_FIXED = frozenset({'gender', 'building_layout', 'inventory_status',
+                             'structure_status', 'booking_status'})
+REFERENCE_VISIBLE = REFERENCE_REVIEWABLE | REFERENCE_FIXED
+
+REFERENCE_DEFINITIONS = {
+    'citizenship_category': ('Гражданство', [('RUSSIAN', 'Российское'), ('FOREIGN', 'Иностранное'), ('ANY', 'Любое')]),
+    'education_basis': ('Основа обучения', [('BUDGET', 'Бюджетная'), ('PAID', 'Платная')]),
+    'occupant_category': ('Категория проживающего', [('ANY', 'Все студенты'), ('BUDGET', 'Бюджетная основа'), ('PAID', 'Платная основа'), ('GUEST', 'Гость')]),
+    'study_status': ('Статус обучения', [('STUDYING', 'Обучается'), ('GRADUATED', 'Завершил обучение'), ('EXPELLED', 'Отчислен'), ('INACTIVE', 'Не обучается')]),
+    'gender': ('Пол проживающего', [('MALE', 'Мужской'), ('FEMALE', 'Женский')]),
+    'gender_policy': ('Ограничение по полу', [('ANY', 'Без ограничений'), ('MALE', 'Мужчины'), ('FEMALE', 'Женщины')]),
+    'building_layout': ('Планировка общежития', [('CORRIDOR', 'Коридорная'), ('BLOCK', 'Блочная'), ('MIXED', 'Смешанная')]),
+    'building_type': ('Тип здания', [('DORMITORY', 'Общежитие'), ('APARTMENT', 'Апартаменты')]),
+    'inventory_mode': ('Тип количественного пула', [('VIRTUAL', 'Виртуальный'), ('PHYSICAL', 'Физический')]),
+    'billing_unit': ('Единица оплаты', [('MONTH', 'Месяц'), ('DAY', 'Сутки')]),
+    'amenity_group': ('Группа оснащения', [('FURNITURE', 'Мебель'), ('PERSONAL_KIT', 'Личные принадлежности'), ('HALLWAY', 'Коридор'), ('KITCHEN', 'Кухня'), ('BATHROOM', 'Санузел'), ('INFRASTRUCTURE', 'Инфраструктура'), ('OTHER', 'Прочее')]),
+    'inventory_status': ('Состояние койко-места', [('DRAFT', 'Черновик'), ('ACTIVE', 'Активно'), ('INACTIVE', 'Неактивно'), ('ARCHIVED', 'В архиве')]),
+    'structure_status': ('Состояние помещений', [('ACTIVE', 'Активно'), ('INACTIVE', 'Неактивно')]),
+    'tariff_status': ('Состояние тарифа', [('ACTIVE', 'Действующий'), ('INACTIVE', 'Архивный')]),
+    'booking_fee_mode': ('Модель стоимости бронирования', [('FIXED', 'Фиксированная сумма'), ('TARIFF_MULTIPLIER', 'Тариф с коэффициентом'), ('TARIFF_TIERS', 'Диапазоны тарифов')]),
+    'booking_mode': ('Способ бронирования', [('EXACT_BED', 'Конкретное койко-место'), ('QUOTA', 'Количественный пул')]),
+    'booking_status': ('Статус бронирования', [('PENDING_ADMIN', 'На рассмотрении'), ('CONFIRMED', 'Подтверждено'), ('CANCELLED', 'Отменено'), ('CANCELLED_BY_ADMIN', 'Отменено администратором'), ('COMPLETED', 'Завершено'), ('NO_SHOW', 'Неявка')]),
+    'organization_type': ('Тип организации', [('UNIVERSITY', 'Университет'), ('APARTMENT_OPERATOR', 'Оператор проживания')]),
+    'quota_status': ('Статус количественного пула', [('ACTIVE', 'Опубликован'), ('INACTIVE', 'Неактивен')]),
+    'user_status': ('Статус пользователя', [('PENDING', 'Ожидает первого входа'), ('ACTIVE', 'Активен'), ('BLOCKED', 'Заблокирован')]),
+}
+
+
+def reference_options(db: Session, organization_id: Optional[int] = None):
+    """Return shared fixed codes plus organization-scoped approved additions.
+
+    Custom values are visible in their organization's reference directory, but
+    *not* selectable by business forms until a corresponding SQL/backend domain
+    extension is introduced. Existing booking constraints must never be bypassed.
+    """
+    overrides = {(r['dictionary_code'], r['value_code']): r['label_ru'] for r in rows(db,
+        'SELECT dictionary_code,value_code,label_ru FROM dorm_booking.reference_value_labels')}
+    additional = {}
+    if organization_id is not None:
+        for item in rows(db, """SELECT dictionary_code,value_code,label_ru
+            FROM dorm_booking.organization_reference_values
+            WHERE organization_id=:org AND is_active=true
+            ORDER BY id""", org=organization_id):
+            additional.setdefault(item['dictionary_code'], []).append({
+                'code': item['value_code'], 'label': item['label_ru'],
+                'is_selectable': False, 'organization_only': True,
+            })
+    return [{'code': key, 'name': title, 'scope': 'PLATFORM',
+             'values': [{'code': code, 'label': overrides.get((key, code), label),
+                         'is_selectable': True}
+                        for code, label in values] + additional.get(key, [])}
+            for key, (title, values) in REFERENCE_DEFINITIONS.items()]
+
+
+def reference_input_values(db: Session, key: str):
+    """Accept current Russian labels, known historic Russian labels and legacy codes."""
+    data = {code.upper(): code for code, _ in REFERENCE_DEFINITIONS[key][1]}
+    for dictionary in reference_options(db):
+        if dictionary['code'] == key:
+            data.update({value['label'].strip().upper(): value['code'] for value in dictionary['values']})
+            break
+    return data
+
+
+@app.get('/api/references')
+def get_reference_dictionaries(db: Session=Depends(db_session), u:dict=Depends(current_user)):
+    roles(u, 'ORG_ADMIN', 'PLATFORM_ADMIN')
+    return reference_options(db, u['organization_id'] if u['role']=='ORG_ADMIN' else None)
+
+
+class ReferenceLabelUpdate(BaseModel):
+    label: str = Field(min_length=2, max_length=150)
+
+
+@app.put('/api/platform/references/{dictionary_code}/{value_code}')
+def update_reference_label(dictionary_code: str, value_code: str, body: ReferenceLabelUpdate,
+                           db: Session=Depends(db_session), u: dict=Depends(current_user)):
+    roles(u, 'PLATFORM_ADMIN')
+    fail('Редактирование существующих системных значений отключено. Новые значения добавляются по заявкам организаций.', 403)
+
+
+class ReferenceChangeRequestIn(BaseModel):
+    dictionary_code: str
+    proposed_label: str = Field(min_length=2, max_length=150)
+    comment: str = Field(min_length=10, max_length=500)
+
+
+@app.get('/api/admin/reference-requests')
+def admin_reference_requests(db: Session=Depends(db_session),u:dict=Depends(current_user)):
+    oid=org_admin(u)
+    return rows(db, """SELECT dictionary_code,proposed_label,comment,status,review_note,
+       created_at,reviewed_at FROM dorm_booking.reference_change_requests
+       WHERE organization_id=:org AND request_type='ADD'
+       ORDER BY created_at DESC,id DESC LIMIT 200""",org=oid)
+
+
+@app.post('/api/admin/reference-requests',status_code=201)
+def admin_request_reference_change(body:ReferenceChangeRequestIn,
+        db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    oid=org_admin(u)
+    if u.get('platform_support_mode'):
+        fail('В режиме сопровождения заявки на справочники запрещены',403)
+    definition=REFERENCE_DEFINITIONS.get(body.dictionary_code)
+    if body.dictionary_code not in REFERENCE_REVIEWABLE or not definition:
+        fail('Для этого справочника заявки на добавление значений недоступны',403)
+    label=body.proposed_label.strip()
+    reason=body.comment.strip()
+    if len(label)<2 or not re.search(r'[А-Яа-яЁё]',label):
+        fail('Укажите название нового значения на русском языке',422)
+    if len(reason)<10:
+        fail('Описание причины должно содержать не менее 10 символов',422)
+    existing_labels=[x['label'].casefold() for x in reference_options(db,oid)
+                     if x['code']==body.dictionary_code for x in x['values']]
+    if label.casefold() in existing_labels:
+        fail('Такое значение уже существует в справочнике организации',409)
+    if scalar(db,"""SELECT 1 FROM dorm_booking.reference_change_requests
+       WHERE organization_id=:org AND dictionary_code=:dict AND request_type='ADD'
+         AND lower(btrim(proposed_label))=lower(:label) AND status='PENDING'""",
+       org=oid,dict=body.dictionary_code,label=label):
+        fail('Заявка с таким названием уже находится на рассмотрении',409)
+    try:
+        rid=scalar(db,"""INSERT INTO dorm_booking.reference_change_requests
+           (organization_id,requested_by_user_id,dictionary_code,value_code,
+            proposed_label,comment,request_type)
+           VALUES (:org,:actor,:dict,'',:label,:comment,'ADD') RETURNING id""",
+           org=oid,actor=u['id'],dict=body.dictionary_code,label=label,comment=reason)
+        log(db,u,'REFERENCE_ADD_REQUESTED','reference_change_requests',rid,
+            details={'dictionary_code':body.dictionary_code,'proposed_label':label})
+        db.commit()
+        return {'ok':True,'status':'PENDING'}
+    except SQLAlchemyError as exc:
+        db.rollback();raise wrap_db_error(exc)
+
+
+@app.get('/api/platform/reference-requests')
+def platform_reference_requests(db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u,'PLATFORM_ADMIN')
+    return rows(db,"""SELECT r.id,r.dictionary_code,r.proposed_label,r.comment,
+       r.status,r.review_note,r.created_at,r.reviewed_at,o.short_name AS organization_name,
+       usr.login AS requested_by_login
+       FROM dorm_booking.reference_change_requests r
+       JOIN dorm_booking.organizations o ON o.id=r.organization_id
+       JOIN dorm_booking.users usr ON usr.id=r.requested_by_user_id
+       WHERE r.request_type='ADD'
+       ORDER BY CASE WHEN r.status='PENDING' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 500""")
+
+
+class ReferenceDecisionIn(BaseModel):
+    status: str
+    review_note: Optional[str] = Field(default=None,max_length=500)
+
+
+@app.post('/api/platform/reference-requests/{request_id}/decision')
+def platform_reference_request_decision(request_id:int,body:ReferenceDecisionIn,
+     db:Session=Depends(db_session),u:dict=Depends(current_user)):
+    roles(u,'PLATFORM_ADMIN')
+    if body.status not in ('APPROVED','REJECTED'):
+        fail('Выберите решение: одобрить или отклонить',422)
+    if body.status=='REJECTED' and not (body.review_note or '').strip():
+        fail('Укажите причину отклонения',422)
+    try:
+        item=row(db,"""SELECT * FROM dorm_booking.reference_change_requests
+            WHERE id=:id FOR UPDATE""",id=request_id)
+        if not item:fail('Заявка не найдена',404)
+        if item['status']!='PENDING':fail('Решение по заявке уже принято',409)
+        if item['request_type']!='ADD':
+            fail('Старые заявки на переименование не могут быть одобрены: существующие значения неизменяемы',409)
+        if item['dictionary_code'] not in REFERENCE_REVIEWABLE:
+            fail('Добавлять значения в этот справочник запрещено',403)
+        if body.status=='APPROVED':
+            # A stable internal code is assigned only after moderation. Codes are
+            # organization-scoped; built-in codes and DB constraints stay intact.
+            proposed=item['proposed_label'].strip()
+            if scalar(db,"""SELECT 1 FROM dorm_booking.organization_reference_values
+                WHERE organization_id=:org AND dictionary_code=:dict
+                  AND lower(btrim(label_ru))=lower(:label)""",
+                org=item['organization_id'],dict=item['dictionary_code'],label=proposed):
+                fail('Такое значение уже добавлено в справочник этой организации',409)
+            shared = next(d for d in reference_options(db)
+                          if d['code']==item['dictionary_code'])
+            if any(proposed.casefold()==entry['label'].casefold()
+                   for entry in shared['values']):
+                fail('Такое значение уже есть в общем справочнике',409)
+            new_code=f"ORG_{item['organization_id']}_{request_id}"
+            db.execute(text("""INSERT INTO dorm_booking.organization_reference_values
+                (organization_id,dictionary_code,value_code,label_ru,created_from_request_id)
+                VALUES (:org,:dict,:code,:label,:request)"""),
+                {'org':item['organization_id'],'dict':item['dictionary_code'],
+                 'code':new_code,'label':proposed,'request':request_id})
+        db.execute(text("""UPDATE dorm_booking.reference_change_requests
+           SET status=:status,review_note=:note,reviewed_by_user_id=:actor,reviewed_at=now()
+           WHERE id=:id"""), {'status':body.status,'note':(body.review_note or '').strip() or None,
+                                'actor':u['id'],'id':request_id})
+        log(db,u,'REFERENCE_ADD_REVIEWED','reference_change_requests',request_id,
+            details={'decision':body.status,'dictionary_code':item['dictionary_code'],
+                     'organization_id':item['organization_id']})
+        db.commit()
+        return {'ok':True,'status':body.status}
+    except HTTPException:
+        db.rollback();raise
+    except SQLAlchemyError as exc:
+        db.rollback();raise wrap_db_error(exc)
+
+
+@app.get('/api/admin/templates/{template_kind}')
+def admin_reference_excel_template(template_kind: str, db: Session = Depends(db_session),
+                                   u: dict = Depends(current_user)):
+    """Build live organization-scoped XLSX with examples and validated dictionaries."""
+    org_id = org_admin(u)
+    if template_kind not in ('students', 'beds'):
+        fail('Доступны шаблоны students и beds', 404)
+    from openpyxl import Workbook
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.utils import get_column_letter
+
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'Студенты' if template_kind == 'students' else 'Места'
+    headers = (['Логин', 'Пароль', 'Фамилия', 'Имя', 'Отчество', 'Пол', 'Гражданство',
+                'Основа обучения', 'Статус обучения', 'Дата начала обучения',
+                'Дата окончания обучения'] if template_kind == 'students' else
+               ['Общежитие', 'Этаж', 'Блок', 'Номер комнаты', 'Вместимость',
+                'Категория комфортности', 'Номер койко-места', 'Пол', 'Номера тарифов'])
+    for col, title in enumerate(headers, 1):
+        cell = sheet.cell(1, col, title)
+        cell.font = Font(color='FFFFFF', bold=True)
+        cell.fill = PatternFill('solid', fgColor='263655')
+        cell.alignment = Alignment(wrap_text=True, vertical='center')
+        sheet.column_dimensions[get_column_letter(col)].width = max(20, min(36, len(title) + 9))
+    sheet.row_dimensions[1].height = 34
+    sheet.freeze_panes = 'A2'
+    sheet.auto_filter.ref = f'A1:{get_column_letter(len(headers))}{MAX_IMPORT_ROWS+1}'
+
+    entries = {item['code']: item['values'] for item in reference_options(db)}
+    labels = lambda code, omit_any=False: [item['label'] for item in entries[code]
+                                           if not omit_any or item['code'] != 'ANY']
+    categories = []
+    buildings = []
+    floors = []
+    blocks = []
+    tariffs = []
+    if template_kind == 'beds':
+        categories = rows(db, '''SELECT id,name FROM dorm_booking.comfort_categories
+            WHERE organization_id=:org AND is_active=true ORDER BY name''', org=org_id)
+        buildings = rows(db, '''SELECT id,name,code FROM dorm_booking.buildings
+            WHERE organization_id=:org ORDER BY name''', org=org_id)
+        floors = rows(db, '''SELECT DISTINCT f.floor_number FROM dorm_booking.floors f
+            WHERE f.organization_id=:org ORDER BY f.floor_number''', org=org_id)
+        blocks = rows(db, '''SELECT DISTINCT name FROM dorm_booking.blocks
+            WHERE organization_id=:org ORDER BY name''', org=org_id)
+        tariffs = rows(db, '''SELECT t.tariff_number,t.status,t.room_capacity,t.id,
+            b.name AS building_name,c.name AS category_name
+            FROM dorm_booking.tariffs t
+            JOIN dorm_booking.buildings b ON b.id=t.building_id AND b.organization_id=t.organization_id
+            LEFT JOIN dorm_booking.comfort_categories c ON c.id=t.comfort_category_id
+            WHERE t.organization_id=:org ORDER BY t.tariff_number,t.id''', org=org_id)
+
+    # Visible dictionary; never query another organization's buildings, blocks or tariffs.
+    instruction = book.create_sheet('Инструкция')
+    instruction.column_dimensions['A'].width = 34
+    instruction.column_dimensions['B'].width = 90
+    instruction.append(['Поле / правило', 'Как заполнять'])
+    required_budget_end = budget_study_end_required(db, org_id) if template_kind == 'students' else False
+    if template_kind == 'students':
+        guidance = [
+            ('Формат дат', 'ДД.ММ.ГГГГ, например 01.09.2026'),
+            ('Логин', 'Обязательное поле для заполнения. Логин должен быть уникален.'),
+            ('Пароль', 'Обязательное поле для заполнения.'),
+            ('Фамилия', 'Обязательное поле для заполнения.'),
+            ('Имя', 'Обязательное поле для заполнения.'),
+            ('Отчество', 'Необязательное поле для заполнения.'),
+            ('Пол, гражданство, основа, статус', 'Обязательные поля для заполнения. Выберите значения из выпадающих списков.'),
+            ('Дата начала обучения', 'Необязательное поле для заполнения.'),
+            ('Дата окончания обучения', 'Для бюджетников ' + ('обязательна по правилам организации. Для контрактников - необязательна' if required_budget_end
+                                                        else 'необязательна при текущих настройках организации. Для контрактников - необязательна')),
+        ]
+    else:
+        guidance = [
+            ('Общежитие и этаж', 'Обязательное поле для заполнения. Здание и этаж должны быть указаны в системе до загрузки данного Excel файла вручную.'),
+            ('Блок', 'Необязательное поле для заполнения. Новый блок, отсутствующий в системе, будет создан автоматически со статусом «Активный». В коридорных общежитиях оставьте пустым.'),
+            ('Номер комнаты, вместимость', 'Обязательные поля для заполнения. Новая комната, отсутствующая в системе, будет создана автоматически со статусом «Активная».'),
+            ('Категория комфортности', 'Для новой комнаты обязательное поле, для существующей - необязательное. Выберите значение из выпадающего списка.'),
+            ('Номер койко-места', 'Обязательное поле для заполнения. Номер должен быть уникален в пределах комнаты. Новое койко-место будет создано со статусом «Черновик».'),
+            ('Пол', 'Необязательное поле для заполнения. По умолчанию «Без ограничений».'),
+            ('Номера тарифов', 'Необязательное поле для заполнения, но при загрузке большого количества мест рекомендуется его заполнить. Можно указывать несколько тарифов через запятую, например 1,2,3. Каждый указанный тариф должен иметь статус «Активный» и соответствовать общежитию, категории и вместимости.'),
+        ]
+    for title, description in guidance:
+        instruction.append([title, description])
+    for cell in instruction[1]:
+        cell.fill = PatternFill('solid', fgColor='263655')
+        cell.font = Font(color='FFFFFF', bold=True)
+    instruction.freeze_panes = 'A2'
+
+    visible = book.create_sheet('Справочники')
+    hidden = book.create_sheet('Справочные значения')
+    hidden.sheet_state = 'hidden'
+    if template_kind == 'students':
+        options = {
+            'Пол': labels('gender'),
+            'Гражданство': labels('citizenship_category', omit_any=True),
+            'Основа обучения': labels('education_basis'),
+            'Статус обучения': labels('study_status')
+        }
+    else:
+        options = {
+            'Пол': labels('gender_policy'),
+            'Категория комфортности': [x['name'] for x in categories],
+            'Общежитие': [x['name'] for x in buildings],
+            'Этаж': [str(x['floor_number']) for x in floors],
+            'Блок': [x['name'] for x in blocks],
+            'Номера тарифов': [str(x['tariff_number']) for x in tariffs
+                              if x['tariff_number'] is not None and x['status'] == 'ACTIVE'],
+        }
+    for idx, (title, choices) in enumerate(options.items(), 1):
+        column = get_column_letter(idx)
+        hidden.cell(1, idx, title)
+        visible.cell(1, idx, title)
+        visible.column_dimensions[column].width = max(23, len(title) + 10)
+        for number, value in enumerate(list(dict.fromkeys(str(x) for x in choices)), 2):
+            hidden.cell(number, idx, value)
+            visible.cell(number, idx, value)
+        if not choices:
+            continue
+        if title == 'Номера тарифов':
+            # A dropdown helps discover tariff numbers but allows comma-separated selections.
+            strict = False
+        else:
+            strict = title != 'Блок'  # unknown blocks are created by the importer
+        col = get_column_letter(headers.index(title) + 1)
+        validation = DataValidation(type='list',
+            formula1="INDIRECT(\"'Справочные значения'!$%s$2:$%s$%s\")" % (column, column, len(set(choices)) + 1),
+            allow_blank=True)
+        validation.showErrorMessage = strict
+        validation.errorTitle = 'Значение отсутствует в справочнике'
+        validation.error = 'Выберите значение из списка вашей организации.'
+        if title == 'Номера тарифов':
+            validation.promptTitle = 'Несколько тарифов'
+            validation.prompt = 'Введите номера через запятую: 1, 2, 4'
+            validation.showInputMessage = True
+        sheet.add_data_validation(validation)
+        validation.add(f'{col}2:{col}{MAX_IMPORT_ROWS+1}')
+    for cell in visible[1]:
+        cell.fill = PatternFill('solid', fgColor='263655')
+        cell.font = Font(color='FFFFFF', bold=True)
+    visible.freeze_panes = 'A2'
+    if template_kind == 'beds':
+        # Provide a complete organization-local tariff context beside the dropdown values.
+        visible['H1'] = 'Номер тарифа'
+        visible['I1'] = 'Общежитие'
+        visible['J1'] = 'Категория'
+        visible['K1'] = 'Вместимость'
+        visible['L1'] = 'Статус'
+        for col in 'HIJKL':
+            visible[f'{col}1'].font = Font(color='FFFFFF', bold=True)
+            visible[f'{col}1'].fill = PatternFill('solid', fgColor='263655')
+            visible.column_dimensions[col].width = 29 if col in 'IJ' else 22
+        for i, tariff in enumerate(tariffs, 2):
+            for col, value in zip('HIJKL', (tariff['tariff_number'], tariff['building_name'],
+                                             tariff['category_name'], tariff['room_capacity'],
+                                             'Активен' if tariff['status'] == 'ACTIVE' else 'Неактивен')):
+                visible[f'{col}{i}'] = value
+    else:
+        # Explicit date formatting in Excel; backend accepts real date cells and DD.MM.YYYY text.
+        for column in ('J', 'K'):
+            for row_number in range(2, MAX_IMPORT_ROWS+2):
+                sheet[f'{column}{row_number}'].number_format = 'DD.MM.YYYY'
+            validation = DataValidation(type='date', operator='between',
+                                        formula1='DATE(1900,1,1)', formula2='DATE(2100,12,31)',
+                                        allow_blank=True)
+            # Text DD.MM.YYYY must remain typeable even in Excel with an English locale.
+            validation.showErrorMessage = False
+            validation.error = 'Укажите дату в формате ДД.ММ.ГГГГ.'
+            sheet.add_data_validation(validation)
+            validation.add(f'{column}2:{column}{MAX_IMPORT_ROWS+1}')
+        if required_budget_end:
+            budget_label = next(v['label'] for v in entries['education_basis'] if v['code'] == 'BUDGET')
+            fill = PatternFill('solid', fgColor='FFF0D5')
+            sheet.conditional_formatting.add(f'K2:K{MAX_IMPORT_ROWS+1}',
+                FormulaRule(formula=[f'AND($H2="{budget_label}",$K2="")'], fill=fill))
+
+    stream = io.BytesIO()
+    book.save(stream)
+    return Response(content=stream.getvalue(),
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': f'attachment; filename={template_kind}_import.xlsx'})
+
 @app.get('/api/platform/amenities')
 def platform_amenities(db:Session=Depends(db_session),u:dict=Depends(current_user)):
     roles(u,'PLATFORM_ADMIN')
-    return rows(db,"""SELECT id,code,name,amenity_group,is_active FROM dorm_booking.amenity_definitions
-        WHERE organization_id IS NULL ORDER BY is_active DESC,amenity_group,name""")
+    return rows(db,"""SELECT a.id,a.code,a.name,a.amenity_group,a.is_active,
+        a.organization_id, o.short_name AS owner_organization_short_name,
+        COALESCE(req.organization_short_name_snapshot, o.short_name, 'Платформа') AS author_organization_short_name,
+        CASE WHEN a.organization_id IS NULL THEN 'GLOBAL' ELSE 'LOCAL' END AS amenity_scope,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                'id', used.organization_id, 'short_name', used.short_name)
+                ORDER BY used.short_name, used.organization_id)
+            FROM (SELECT DISTINCT av.organization_id,o.short_name
+                FROM dorm_booking.amenity_values av
+                JOIN dorm_booking.organizations o ON o.id=av.organization_id
+                WHERE av.amenity_id=a.id AND av.is_present=true) used),
+            '[]'::jsonb) AS used_by_organizations
+        FROM dorm_booking.amenity_definitions a
+        LEFT JOIN dorm_booking.organizations o ON o.id=a.organization_id
+        LEFT JOIN LATERAL (
+            SELECT cr.organization_short_name_snapshot
+            FROM dorm_booking.amenity_change_requests cr
+            WHERE cr.created_amenity_id=a.id AND cr.status='APPROVED'
+            ORDER BY cr.reviewed_at ASC NULLS LAST,cr.id ASC LIMIT 1
+        ) req ON TRUE
+        ORDER BY a.is_active DESC,a.organization_id NULLS FIRST,a.amenity_group,a.name""")
 
 
 @app.post('/api/platform/amenities')
@@ -4193,10 +5279,49 @@ def platform_admin_create(body:AdminIn,db:Session=Depends(db_session),u:dict=Dep
 
 
 @app.get('/api/platform/logs')
-def platform_logs(db:Session=Depends(db_session),u:dict=Depends(current_user)):
+def platform_logs(query:Optional[str]=None, result:Optional[str]=None,
+                  event_type:Optional[str]=None,organization_id:Optional[int]=None,
+                  date_from:Optional[date]=None,date_to:Optional[date]=None,
+                  limit:int=100,offset:int=0,
+                  db:Session=Depends(db_session),u:dict=Depends(current_user)):
     roles(u,'PLATFORM_ADMIN')
-    return rows(db,"""SELECT l.*,concat_ws(' ',u.last_name,u.first_name,u.middle_name) AS actor_name FROM dorm_booking.activity_logs l
-        LEFT JOIN dorm_booking.users u ON u.id=l.actor_user_id ORDER BY l.created_at DESC LIMIT 100""")
+    if not 1<=limit<=500 or offset<0:
+        fail('Допустимая страница журнала: limit 1–500, offset от 0',422)
+    if result and result not in ('SUCCESS','ERROR','INFO'):
+        fail('Недопустимый результат операции',422)
+    if date_from and date_to and date_from>date_to:
+        fail('Начальная дата не может быть позже конечной',422)
+    filters=[]
+    params={'limit':limit,'offset':offset}
+    if query and query.strip():
+        filters.append('''(l.message ILIKE :search OR l.event_type ILIKE :search OR
+            l.entity_type ILIKE :search OR u.login ILIKE :search OR
+            u.archived_login ILIKE :search OR
+            coalesce(o.short_name,'') ILIKE :search OR
+            CAST(l.id AS text) = :exact_search)''')
+        params.update(search='%'+query.strip()[:120]+'%',exact_search=query.strip()[:120])
+    if result:
+        filters.append('l.result=:result');params['result']=result
+    if event_type:
+        filters.append('l.event_type=:event');params['event']=event_type
+    if organization_id is not None:
+        filters.append('l.organization_id=:org');params['org']=organization_id
+    if date_from:
+        filters.append('l.created_at >= CAST(:date_from AS date)');params['date_from']=date_from
+    if date_to:
+        filters.append("l.created_at < (CAST(:date_to AS date) + INTERVAL '1 day')");params['date_to']=date_to
+    join='''FROM dorm_booking.activity_logs l
+       LEFT JOIN dorm_booking.users u ON u.id=l.actor_user_id
+       LEFT JOIN dorm_booking.organizations o ON o.id=l.organization_id'''
+    where=(' WHERE '+' AND '.join(filters)) if filters else ''
+    total=scalar(db,'SELECT count(*) '+join+where,**params)
+    data=rows(db,'''SELECT l.*,COALESCE(u.archived_login,u.login) AS actor_login,
+       concat_ws(' ',u.last_name,u.first_name,u.middle_name) AS actor_name,
+       o.short_name AS organization_short_name '''+join+where+
+       ' ORDER BY l.created_at DESC,l.id DESC LIMIT :limit OFFSET :offset',**params)
+    event_types=[r['event_type'] for r in rows(db,
+        'SELECT DISTINCT event_type FROM dorm_booking.activity_logs ORDER BY event_type')]
+    return {'items':data,'total':total or 0,'offset':offset,'limit':limit,'event_types':event_types}
 
 
 class GuestRequest(BaseModel):
@@ -4491,7 +5616,7 @@ def quote(body: QuoteInput, db: Session=Depends(db_session), u:dict=Depends(curr
        org=offer['organization_id'],stay=stay,tariff=tariff['amount'],
        cat=category,cit=citizenship,unit=tariff['billing_unit'])
     building_photo=row(db,"""SELECT bu.name AS building_name,
-         (SELECT CASE WHEN mf.relative_path LIKE '/media/%' THEN mf.relative_path
+         (SELECT CASE WHEN mf.relative_path LIKE '/media/%' OR mf.relative_path LIKE '/api/media/s3/%' THEN mf.relative_path
             ELSE '/media/' || ltrim(mf.relative_path,'/') END
             FROM dorm_booking.media_files mf WHERE mf.building_id=bu.id
             ORDER BY mf.is_primary DESC,mf.sort_order,mf.id LIMIT 1) AS photo_url
@@ -4704,7 +5829,36 @@ def delete_fee_tier(tier_id:int,db:Session=Depends(db_session),u:dict=Depends(cu
 
 
 def media_location(relative_path: str) -> str:
-    return relative_path if relative_path.startswith('/media/') else '/media/' + relative_path.lstrip('/')
+    if relative_path.startswith(('/media/', s3_storage.S3_ROUTE, 'https://')):
+        return relative_path
+    return '/media/' + relative_path.lstrip('/')
+
+
+@app.get('/api/media/s3/{key:path}')
+def s3_photo_content(key:str,db:Session=Depends(db_session)):
+    """Publicly readable *only* if the object is referenced in image metadata.
+
+    S3 credentials stay server-side, and the bucket can stay private.
+    """
+    try:
+        url=s3_storage.object_url(key)
+    except ValueError:
+        fail('Фотография не найдена',404)
+    linked=scalar(db,"""SELECT 1 WHERE EXISTS (
+         SELECT 1 FROM dorm_booking.media_files WHERE relative_path=:url
+       ) OR EXISTS (
+         SELECT 1 FROM dorm_booking.organizations WHERE brand_logo_url=:url
+       )""",url=url)
+    if not linked:
+        fail('Фотография не найдена',404)
+    try:
+        payload=s3_storage.read(key)
+    except Exception:
+        import logging
+        logging.getLogger('dorm_booking.s3').exception('S3 read failed')
+        fail('Фотография временно недоступна в хранилище',503)
+    return Response(content=payload,media_type='image/webp',
+                    headers={'Cache-Control':'public, max-age=86400','X-Content-Type-Options':'nosniff'})
 
 
 @app.get('/api/admin/media')
@@ -4756,7 +5910,15 @@ def admin_media_delete(media_id: int, db: Session = Depends(db_session),
         log(db,u,'PHOTO_REMOVED','media_files',media_id)
         db.commit()
         relative = item['relative_path']
-        if relative.startswith('uploads/'):
+        key=s3_storage.object_key(relative)
+        if key:
+            try:
+                s3_storage.delete(key)
+            except Exception:
+                import logging
+                logging.getLogger('dorm_booking.s3').exception('S3 deletion failed; orphan may require cleanup')
+                return {'ok':True,'warning':'Запись удалена, но S3-файл не удалился. Проверьте журнал сервера.'}
+        elif relative.startswith('uploads/'):
             stored = (MEDIA_DIR / relative).resolve()
             if stored.is_relative_to((MEDIA_DIR/'uploads').resolve()):
                 stored.unlink(missing_ok=True)
@@ -4789,23 +5951,43 @@ async def upload_photo(request: Request, file:UploadFile=File(...), db:Session=D
         picture.thumbnail((2200,1600))
     except (UnidentifiedImageError,ValueError):
         fail('Файл не является изображением')
-    uploads=MEDIA_DIR/'uploads'
-    uploads.mkdir(exist_ok=True)
-    file_name=secrets.token_hex(16)+'.webp'
-    path=uploads/file_name
-    picture.save(path,'WEBP',quality=84)
+    output=io.BytesIO()
+    picture.save(output,'WEBP',quality=84)
+    image_bytes=output.getvalue()
+    stored_key=None
+    path=None
+    if s3_storage.configured_mode()=='s3':
+        stored_key=f'organizations/{oid}/photos/{secrets.token_hex(16)}.webp'
+        try:
+            s3_storage.put(stored_key,image_bytes)
+        except Exception:
+            import logging
+            logging.getLogger('dorm_booking.s3').exception('S3 photo upload failed')
+            fail('Не удалось сохранить фотографию в S3. Проверьте ключи доступа, бакет и сеть.',503)
+        url=s3_storage.object_url(stored_key)
+    else:
+        uploads=MEDIA_DIR/'uploads'
+        uploads.mkdir(parents=True,exist_ok=True)
+        path=uploads/(secrets.token_hex(16)+'.webp')
+        path.write_bytes(image_bytes)
+        url='uploads/'+path.name
     try:
         mid=scalar(db,f"""INSERT INTO dorm_booking.media_files
           (organization_id,{column},original_filename,relative_path,mime_type,size_bytes,uploaded_by)
           VALUES(:o,:target,:original,:path,'image/webp',:size,:actor) RETURNING id""",
-          o=oid,target=target_id,original=file.filename or 'photo',path='uploads/'+file_name,
-          size=path.stat().st_size,actor=u['id'])
+          o=oid,target=target_id,original=file.filename or 'photo',path=url,
+          size=len(image_bytes),actor=u['id'])
         log(db,u,'PHOTO_UPLOADED','media_files',mid)
         db.commit()
-        return {'id':mid,'url':'/media/uploads/'+file_name}
+        return {'id':mid,'url':media_location(url)}
     except SQLAlchemyError as e:
-        path.unlink(missing_ok=True)
         db.rollback()
+        if path:path.unlink(missing_ok=True)
+        if stored_key:
+            try:s3_storage.delete(stored_key)
+            except Exception:
+                import logging
+                logging.getLogger('dorm_booking.s3').exception('S3 rollback cleanup failed')
         raise wrap_db_error(e)
 
 
@@ -4826,22 +6008,43 @@ async def admin_upload_brand_logo(file: UploadFile = File(...),
         image.thumbnail((700, 280))
     except (UnidentifiedImageError, ValueError, OSError):
         fail('Загрузите корректное изображение эмблемы', 422)
-    uploads = MEDIA_DIR / 'uploads'
-    uploads.mkdir(parents=True, exist_ok=True)
-    path = uploads / (secrets.token_hex(16) + '.webp')
-    image.save(path, 'WEBP', quality=88)
-    url = '/media/uploads/' + path.name
+    output=io.BytesIO()
+    image.save(output,'WEBP',quality=88)
+    content=output.getvalue()
+    path=None
+    stored_key=None
+    if s3_storage.configured_mode()=='s3':
+        stored_key=f'organizations/{org_id}/logos/{secrets.token_hex(16)}.webp'
+        try:
+            s3_storage.put(stored_key,content)
+        except Exception:
+            import logging
+            logging.getLogger('dorm_booking.s3').exception('S3 logo upload failed')
+            fail('Не удалось сохранить эмблему в S3. Проверьте подключение.',503)
+        url=s3_storage.object_url(stored_key)
+    else:
+        uploads=MEDIA_DIR/'uploads'
+        uploads.mkdir(parents=True,exist_ok=True)
+        path=uploads/(secrets.token_hex(16)+'.webp')
+        path.write_bytes(content)
+        url='/media/uploads/'+path.name
     try:
-        db.execute(text('''UPDATE dorm_booking.organizations
-            SET brand_logo_url=:logo WHERE id=:id'''),
+        db.execute(text("""UPDATE dorm_booking.organizations
+            SET brand_logo_url=:logo WHERE id=:id"""),
             {'logo': url, 'id': org_id})
         log(db, u, 'ORGANIZATION_BRAND_LOGO_UPDATED', 'organizations', org_id)
         db.commit()
         return {'ok': True, 'brand_logo_url': url}
     except SQLAlchemyError as exc:
         db.rollback()
-        path.unlink(missing_ok=True)
+        if path:path.unlink(missing_ok=True)
+        if stored_key:
+            try:s3_storage.delete(stored_key)
+            except Exception:
+                import logging
+                logging.getLogger('dorm_booking.s3').exception('S3 rollback logo cleanup failed')
         raise wrap_db_error(exc)
+
 
 
 class BuildingEdit(BaseModel):
