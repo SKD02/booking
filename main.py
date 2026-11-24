@@ -3125,9 +3125,16 @@ async def import_beds_excel(
                 org=oid, room=room_id, number=bed_number, gender=gender,
                 tariff=tariff_ids[0])
             for tariff_id in tariff_ids:
-                db.execute(text("""INSERT INTO dorm_booking.bed_tariff_links
-                    (organization_id,bed_id,tariff_id) VALUES (:org,:bed,:tariff)"""),
-                    {'org': oid, 'bed': bed_id, 'tariff': tariff_id})
+                db.execute(text("""
+                    INSERT INTO dorm_booking.bed_tariff_links
+                        (organization_id, bed_id, tariff_id)
+                    VALUES (:org, :bed, :tariff)
+                    ON CONFLICT (bed_id, tariff_id) DO NOTHING
+                """), {
+                    'org': oid,
+                    'bed': bed_id,
+                    'tariff': tariff_id
+                })
         log(db, u, 'IMPORT_BEDS', 'beds', None, 'Импорт койко-мест из Excel',
             {'count': len(prepared), 'created_rooms': len(created_rooms),
              'created_blocks': len(created_blocks),
@@ -3139,6 +3146,39 @@ async def import_beds_excel(
                 'assigned_tariff_links': sum(len(items[3]) for items in prepared), 'errors': []}
     except SQLAlchemyError as exc:
         db.rollback()
+        # During Excel import report the exact uniqueness cause.  A generic 409
+        # conceals both stale ID sequences and other conflicting DB constraints.
+        if isinstance(exc, IntegrityError):
+            original = getattr(exc, 'orig', None)
+            state = getattr(original, 'sqlstate', None) or getattr(original, 'pgcode', None)
+            diag = getattr(original, 'diag', None)
+            constraint = getattr(diag, 'constraint_name', None)
+            if state == '23505':
+                known_conflicts = {
+                    'uq_bed_room_number': 'Койко-место с таким номером уже существует в выбранной комнате.',
+                    'uq_room_in_block': 'Комната с таким номером уже существует в выбранном блоке.',
+                    'uq_room_without_block': 'Комната с таким номером уже существует на выбранном этаже.',
+                    'uq_block_building_code': 'Код блока уже существует в этом общежитии.',
+                    'bed_tariff_links_pk': 'Связь койко-места и тарифа уже существует. Проверьте триггер trg_sync_imported_bed_tariff и версию backend.',
+                }
+                if constraint in known_conflicts:
+                    raise HTTPException(status_code=409, detail='Импорт койко-мест: ' + known_conflicts[constraint]) from exc
+                if constraint in {'beds_pkey', 'rooms_pkey', 'blocks_pkey'}:
+                    table = constraint.removesuffix('_pkey')
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f'Импорт койко-мест: конфликт ID в таблице {table}. '
+                               'Возможно, после ручного переноса CSV отстаёт последовательность ID. '
+                               'Проверьте приложенный SQL_диагностика_ID_v6_45.sql.'
+                    ) from exc
+                # The constraint name is safe diagnostics; never include DB values
+                # from diag.message_detail (which may contain personal data).
+                if constraint and re.fullmatch(r'[a-zA-Z0-9_]{1,100}', constraint):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f'Импорт койко-мест: конфликт уникальности PostgreSQL ({constraint}). '
+                               'Проверьте ранее загруженные блоки, комнаты и номера мест.'
+                    ) from exc
         raise wrap_db_error(exc)
 
 
@@ -5963,7 +6003,7 @@ async def upload_photo(request: Request, file:UploadFile=File(...), db:Session=D
         except Exception:
             import logging
             logging.getLogger('dorm_booking.s3').exception('S3 photo upload failed')
-            fail('Не удалось сохранить фотографию в S3. Проверьте ключи доступа, бакет и сеть.',503)
+            fail('Не удалось сохранить фотографию в S3',503)
         url=s3_storage.object_url(stored_key)
     else:
         uploads=MEDIA_DIR/'uploads'
